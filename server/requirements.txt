@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+pydantic-settings
+sqlalchemy>=2
+alembic
+httpx
+apscheduler<4
+pillow
+boto3
+tzdata
+python-multipart
+pytest
+ruff

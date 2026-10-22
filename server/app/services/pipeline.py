@@ -1,0 +1,332 @@
+"""Pipeline clip: download → analisi → render → review gate. Ogni step è idempotente e ripartibile."""
+from __future__ import annotations
+
+import hashlib
+import random
+from datetime import timedelta
+from pathlib import Path
+
+from sqlalchemy import or_, select
+from sqlalchemy.orm import Session
+
+from app.adapters.ai.base import AnalysisContext, Transcript
+from app.adapters.video import ffmpeg
+from app.adapters.video.renderer import FFmpegRenderer, fingerprint
+from app.core.config import get_env
+from app.core.errors import ClipyError, PermanentError, TemporaryError
+from app.core.timeutil import utcnow
+from app.db.models import Analysis, Clip, PublicationJob, RenderJob, Review, Template
+from app.domain import review_gate
+from app.domain import states as S
+from app.services import events, factory, leases
+from app.services import settings_service as ss
+from app.services.templates import TemplateConfig, get_template
+
+MAX_STEP_ATTEMPTS = 4
+
+
+def backoff(attempts: int) -> timedelta:
+    return timedelta(seconds=min(2 ** attempts * 15, 1800) * random.uniform(0.8, 1.2))
+
+
+# ---------------------------------------------------------------- download
+def step_download(db: Session, clip: Clip) -> None:
+    st = ss.get_settings(db)
+    tw = st.twitch
+    now = utcnow()
+    source = factory.clip_source(db, st)
+    dl = factory.downloader(db, st, source)
+    if clip.waiting_since is None:
+        clip.waiting_since = now
+    try:
+        urls = source.get_download_urls(clip.broadcaster_id, [clip.source_clip_id]).get(clip.source_clip_id)
+        if urls is None or (not urls.portrait and not urls.landscape):
+            raise TemporaryError("Twitch non ha ancora link di download per la clip", code="no_download_url")
+        use_portrait = bool(urls.portrait) and tw.prefer_portrait
+        clip.portrait_available = bool(urls.portrait)
+        if not use_portrait and tw.prefer_portrait and not urls.portrait:
+            deadline = clip.waiting_since + timedelta(minutes=tw.portrait_wait_minutes)
+            if now < deadline:  # attende brevemente che Twitch generi la versione portrait
+                events.transition(db, "clip", clip, S.WAITING_FOR_MEDIA, "portrait non ancora disponibile")
+                clip.next_attempt_at = now + timedelta(seconds=min(60, max(5, tw.portrait_wait_minutes * 6)))
+                return
+        url = urls.portrait if use_portrait else (urls.landscape or urls.portrait)
+        clip.landscape_fallback = not use_portrait
+        dest = get_env().dir("originals") / f"{clip.id}.mp4"
+        dl.download(url, dest, tw.max_download_mb * 1024 * 1024)
+        info = ffmpeg.probe(dest)  # valida integrità
+        if info["duration"] < 1:
+            dest.unlink(missing_ok=True)
+            raise PermanentError("Clip troppo corta o corrotta", code="bad_media")
+        clip.original_path = str(dest)
+        clip.checksum = hashlib.sha256(dest.read_bytes()).hexdigest()
+        clip.media_info = {**(clip.media_info or {}), **info}
+        clip.is_portrait_file = ffmpeg.is_portrait(info)
+        if clip.landscape_fallback and clip.is_portrait_file:
+            clip.landscape_fallback = False
+        clip.error = None
+        events.transition(db, "clip", clip, S.DOWNLOADED, "portrait" if clip.is_portrait_file else "landscape (fallback)")
+        events.emit(db, "downloader", "downloaded", f"Scaricata {clip.source_clip_id} ({'portrait' if clip.is_portrait_file else 'landscape'})", clip_id=clip.id)
+    except TemporaryError as exc:
+        clip.download_attempts += 1
+        clip.error = exc.message
+        if clip.download_attempts >= 6:
+            events.transition(db, "clip", clip, S.FAILED, exc.message)
+        else:
+            events.transition(db, "clip", clip, S.WAITING_FOR_MEDIA, exc.message)
+            clip.next_attempt_at = utcnow() + backoff(clip.download_attempts)
+        events.emit(db, "downloader", "download_retry", exc.message, severity="warning", clip_id=clip.id)
+    except ClipyError as exc:
+        clip.error = exc.message
+        events.transition(db, "clip", clip, S.FAILED, exc.message)
+        events.emit(db, "downloader", "download_failed", exc.message, severity="error", clip_id=clip.id)
+
+
+# ---------------------------------------------------------------- analisi
+def _recent_titles(db: Session, clip: Clip, n: int = 30) -> list[str]:
+    rows = db.scalars(select(Clip.overlay_title).where(Clip.id != clip.id, Clip.overlay_title.is_not(None)).order_by(Clip.discovered_at_utc.desc()).limit(n))
+    return [r for r in rows if r]
+
+
+def build_context(db: Session, clip: Clip, transcript: Transcript, frames: list[Path], *, variation: int = 0, avoid: list[str] | None = None) -> AnalysisContext:
+    ai = ss.get_settings(db).ai
+    return AnalysisContext(
+        clip_title=clip.title, game_name=clip.game_name, transcript=transcript, frames=frames, duration=clip.duration, language=ai.language,
+        tone=ai.tone, prompt_extra=ai.prompt_extra, banned_words=ai.banned_words, max_emoji=ai.max_emoji, max_hashtags=ai.max_hashtags,
+        max_overlay_chars=ai.max_overlay_chars, avoid_titles=avoid or [], variation=variation,
+        demo_fixture=(clip.media_info or {}).get("demo_fixture") if clip.is_demo else None)
+
+
+def _apply_analysis(db: Session, clip: Clip, transcript: Transcript, visual_notes: list[str], res, *, variation_note: str = "") -> Analysis:
+    out = res.output
+    flags = list(out.quality_flags)
+    if res.simulated and not clip.is_demo:
+        flags.append("simulated_analysis")
+    a = Analysis(clip_id=clip.id, transcript=transcript.text, segments=transcript.segments, language=transcript.language or out.language,
+                 asr_engine=transcript.engine, asr_available=transcript.available, visual_notes=visual_notes,
+                 structured=out.model_dump(), confidence=out.confidence, quality_flags=flags, prompt_version=res.prompt_version,
+                 provider=res.provider, model=res.model, simulated=res.simulated or transcript.simulated, tokens_in=res.tokens_in,
+                 tokens_out=res.tokens_out, cost_usd=res.cost_usd, timings=res.timings)
+    db.add(a)
+    clip.overlay_title, clip.caption, clip.hashtags = out.overlay_title, out.tiktok_caption, out.hashtags
+    clip.content_version += 1
+    db.flush()
+    return a
+
+
+def step_analyze(db: Session, clip: Clip) -> None:
+    st = ss.get_settings(db)
+    video = Path(clip.original_path or "")
+    if not video.exists():
+        clip.error = "File originale mancante"
+        events.transition(db, "clip", clip, S.FAILED, clip.error)
+        return
+    events.transition(db, "clip", clip, S.ANALYZING)
+    db.commit()
+    try:
+        if st.ai.transcription == "off" and not clip.is_demo:
+            tr = Transcript("", [], "", "off", available=False, note="ASR disattivato")
+        else:
+            tr = factory.transcriber(db, st, clip.is_demo).transcribe(video, st.ai.language)
+        frames: list[Path] = []
+        if st.ai.vision_enabled and not clip.is_demo:
+            frames = ffmpeg.extract_frames(video, get_env().dir("temp") / f"frames-{clip.id}", st.ai.frame_interval_seconds, st.ai.max_frames, clip.duration)
+        ctx = build_context(db, clip, tr, frames)
+        res = factory.analyzer(db, st, clip.is_demo).analyze(ctx)
+        notes: list[str] = []
+        if clip.is_demo:
+            from app.adapters.video.fixtures import FIXTURES
+
+            fx = FIXTURES.get(ctx.demo_fixture or "")
+            notes = [f"[SIMULATO] {v}" for v in (fx.visual if fx else ())]
+        elif frames:
+            notes = [res.output.scene_summary] if res.output.scene_summary else []
+        _apply_analysis(db, clip, tr, notes, res)
+        clip.error = None
+        events.transition(db, "clip", clip, S.ANALYZED)
+        events.emit(db, "ai", "analyzed", f"Analisi completata ({res.provider}{' simulato' if res.simulated else ''}, ~${res.cost_usd})", clip_id=clip.id)
+    except TemporaryError as exc:
+        clip.step_attempts += 1
+        events.emit(db, "ai", "analysis_retry", exc.message, severity="warning", clip_id=clip.id)
+        events.transition(db, "clip", clip, S.FAILED if clip.step_attempts >= MAX_STEP_ATTEMPTS else S.DOWNLOADED, exc.message)
+        clip.error, clip.next_attempt_at = exc.message, utcnow() + backoff(clip.step_attempts)
+    except ClipyError as exc:
+        clip.error = exc.message
+        events.transition(db, "clip", clip, S.FAILED, exc.message)
+        events.emit(db, "ai", "analysis_failed", exc.message, severity="error", clip_id=clip.id)
+    finally:
+        for p in (get_env().dir("temp")).glob(f"frames-{clip.id}*"):
+            import shutil
+
+            shutil.rmtree(p, ignore_errors=True)
+
+
+def regenerate_content(db: Session, clip: Clip) -> None:
+    """Rigenera titolo/caption senza ripetere download né ASR (riusa la trascrizione dell'ultima analisi)."""
+    last = latest_analysis(db, clip)
+    if last is None:
+        raise ClipyError("Nessuna analisi precedente: esegui prima l'analisi", code="no_analysis", status_code=409)
+    st = ss.get_settings(db)
+    tr = Transcript(last.transcript, last.segments, last.language, last.asr_engine, last.asr_available, last.simulated)
+    variation = db.query(Analysis).filter(Analysis.clip_id == clip.id).count()
+    avoid = [clip.overlay_title or ""] + [a.structured.get("overlay_title", "") for a in clip.analyses][-3:]
+    ctx = build_context(db, clip, tr, [], variation=variation, avoid=[x for x in avoid if x])
+    res = factory.analyzer(db, st, clip.is_demo).analyze(ctx)
+    _apply_analysis(db, clip, tr, last.visual_notes, res)
+    invalidate_render(db, clip)
+    events.emit(db, "ai", "regenerated", "Titolo/caption rigenerati senza nuovo download", clip_id=clip.id)
+
+
+def latest_analysis(db: Session, clip: Clip) -> Analysis | None:
+    return db.scalar(select(Analysis).where(Analysis.clip_id == clip.id).order_by(Analysis.created_at.desc(), Analysis.id.desc()))
+
+
+# ---------------------------------------------------------------- render
+def active_template(db: Session, clip: Clip) -> tuple[Template, TemplateConfig]:
+    st = ss.get_settings(db)
+    t = get_template(db, clip.template_id or st.render.active_template_id)
+    return t, TemplateConfig.model_validate(t.config)
+
+
+def invalidate_render(db: Session, clip: Clip, *, to_status: str = S.ANALYZED) -> None:
+    """Invalida render e job locali dipendenti (senza toccare il sorgente)."""
+    clip.render_path, clip.render_fingerprint = None, None
+    for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == clip.id, PublicationJob.status.in_([S.QUEUED_LOCAL, S.RETRY_PENDING, S.DRY_RUN_OK]))):
+        events.transition(db, "publication", j, S.CANCELLED, "contenuto modificato")
+    if clip.status not in (S.REJECTED, S.SKIPPED, S.FAILED) or to_status == S.ANALYZED:
+        events.transition(db, "clip", clip, to_status, "render invalidato")
+    db.flush()
+
+
+def step_render(db: Session, clip: Clip) -> None:
+    st = ss.get_settings(db)
+    tpl, cfg = active_template(db, clip)
+    text = clip.overlay_title or ""
+    fp = fingerprint(clip.checksum or "", text, cfg, {"fps": st.render.fps, "v": tpl.version})
+    out_dir = get_env().dir("rendered")
+    out = out_dir / f"{clip.id}-v{clip.content_version}.mp4"
+    events.transition(db, "clip", clip, S.RENDERING)
+    db.commit()
+    warnings: list[str] = []
+    checks: dict = {}
+    if clip.render_fingerprint == fp and clip.render_path and Path(clip.render_path).exists():
+        last = db.scalar(select(RenderJob).where(RenderJob.clip_id == clip.id, RenderJob.status == "DONE").order_by(RenderJob.finished_at.desc()))
+        checks, warnings = (last.checks, last.warnings) if last else ({}, [])
+        job = None
+    else:
+        job = RenderJob(clip_id=clip.id, template_id=tpl.id, template_version=tpl.version, reference_verified=tpl.reference_verified, fingerprint=fp)
+        db.add(job)
+        db.commit()
+        try:
+            r = FFmpegRenderer(st.render.fps, st.render.video_bitrate_k, st.render.audio_bitrate_k, st.render.preset).render(Path(clip.original_path or ""), text, cfg, out, source_checksum=clip.checksum or "")
+            checks, warnings = r.checks, r.warnings
+            job.status, job.output_path, job.checks, job.warnings, job.finished_at = "DONE", str(out), checks, warnings, utcnow()
+            clip.render_path, clip.render_fingerprint = str(out), fp
+        except ClipyError as exc:
+            job.status, job.error, job.finished_at = "FAILED", exc.message, utcnow()
+            clip.error = exc.message
+            events.transition(db, "clip", clip, S.FAILED, exc.message)
+            events.emit(db, "renderer", "render_failed", exc.message, severity="error", clip_id=clip.id)
+            return
+    clip.template_id = tpl.id if clip.template_id else clip.template_id
+    clip.error = None
+    events.transition(db, "clip", clip, S.READY)
+    events.emit(db, "renderer", "rendered", f"Render pronto ({tpl.name}{'' if tpl.reference_verified else ', reference NON verificata'})", clip_id=clip.id)
+    run_gate(db, clip, checks, warnings)
+
+
+# ---------------------------------------------------------------- review gate
+def run_gate(db: Session, clip: Clip, checks: dict, warnings: list[str]) -> None:
+    st = ss.get_settings(db)
+    a = latest_analysis(db, clip)
+    s = a.structured if a else {}
+    inp = review_gate.GateInput(
+        transcript=a.transcript if a else "", visual_notes=a.visual_notes if a else [], game_name=clip.game_name, clip_title=clip.title,
+        overlay_title=clip.overlay_title or "", caption=clip.caption or "", hashtags=clip.hashtags or [], confidence=a.confidence if a else 0.0,
+        llm_requires_review=bool(s.get("requires_review")), llm_reason=s.get("reason"), quality_flags=(a.quality_flags if a else []),
+        asr_available=a.asr_available if a else True, render_checks=checks, render_warnings=warnings, landscape_fallback=clip.landscape_fallback,
+        max_caption_length=st.publishing.max_caption_length, banned_words=st.ai.banned_words, max_overlay_chars=st.ai.max_overlay_chars,
+        max_emoji=st.ai.max_emoji, recent_titles=_recent_titles(db, clip), simulated_scenario=clip.demo_scenario if clip.is_demo else "")
+    if inp.landscape_fallback and st.twitch.landscape_fallback == "review":
+        inp.render_warnings = [*inp.render_warnings, "crop_unvalidated"]
+    res = review_gate.evaluate(inp, st.review)
+    if "simulated_analysis" in (a.quality_flags if a else []):
+        res.flags.append("simulated_analysis")
+        res.reasons.append({"code": "simulated_analysis", "message": "Analisi AI SIMULATA su clip reale (nessun provider configurato): serve revisione."})
+        res.state = "NEEDS_REVIEW"
+    if clip.approve_after_render and clip.human_edited:
+        new_state, actor = S.APPROVED, "human"
+        db.add(Review(clip_id=clip.id, policy_version=res.policy_version, review_state=S.APPROVED, reasons=res.reasons, flags=res.flags,
+                      human_override=True, actor=actor, reviewed_at=utcnow(), note="Approvata dopo modifica umana"))
+        clip.approve_after_render = False
+    else:
+        new_state = S.NEEDS_REVIEW if res.needs_review else S.AUTO_READY
+        db.add(Review(clip_id=clip.id, policy_version=res.policy_version, review_state=new_state, reasons=res.reasons, flags=res.flags, actor="system"))
+    events.transition(db, "clip", clip, new_state, ", ".join(res.flags) or "review gate ok")
+    events.emit(db, "review", "gate", f"Review gate → {new_state}" + (f" ({', '.join(res.flags)})" if res.flags else ""), clip_id=clip.id)
+
+
+# ---------------------------------------------------------------- orchestrazione
+def next_clip_id(db: Session) -> tuple[str, str] | None:
+    now = utcnow()
+    order = [S.RENDERING, S.ANALYZING, S.ANALYZED, S.DOWNLOADED, S.DISCOVERED, S.WAITING_FOR_MEDIA]
+    for status in order:
+        q = select(Clip.id).where(Clip.status == status, Clip.paused.is_(False), or_(Clip.locked_until.is_(None), Clip.locked_until < now))
+        if status in (S.DISCOVERED, S.WAITING_FOR_MEDIA, S.DOWNLOADED):
+            q = q.where(or_(Clip.next_attempt_at.is_(None), Clip.next_attempt_at <= now))
+        row = db.scalar(q.order_by(Clip.created_at_utc.asc()).limit(1))
+        if row:
+            return row, status
+    return None
+
+
+def advance_one(db: Session) -> bool:
+    nxt = next_clip_id(db)
+    if not nxt:
+        return False
+    cid, status = nxt
+    if not leases.lock_row(db, Clip, cid, 900):
+        return True
+    try:
+        clip = db.get(Clip, cid)
+        assert clip is not None
+        if status in (S.DISCOVERED, S.WAITING_FOR_MEDIA):
+            step_download(db, clip)
+        elif status in (S.DOWNLOADED, S.ANALYZING):
+            step_analyze(db, clip)
+        elif status in (S.ANALYZED, S.RENDERING):
+            step_render(db, clip)
+        db.commit()
+    except Exception as exc:  # errore inatteso: non blocca la pipeline
+        db.rollback()
+        clip = db.get(Clip, cid)
+        if clip:
+            clip.error = f"Errore inatteso: {exc}"[:500]
+            clip.step_attempts += 1
+            if clip.step_attempts >= MAX_STEP_ATTEMPTS:
+                events.transition(db, "clip", clip, S.FAILED, clip.error)
+            else:
+                clip.next_attempt_at = utcnow() + backoff(clip.step_attempts)
+            events.emit(db, "pipeline", "unexpected_error", clip.error, severity="error", clip_id=cid)
+            db.commit()
+    finally:
+        leases.unlock_row(db, Clip, cid)
+    return True
+
+
+def run_until_idle(db: Session, max_steps: int = 200) -> int:
+    n = 0
+    while n < max_steps and advance_one(db):
+        n += 1
+    return n
+
+
+def retry_clip(db: Session, clip: Clip) -> None:
+    """Riporta una clip FAILED al primo step ripartibile (non scarta file)."""
+    if clip.original_path and Path(clip.original_path).exists():
+        target = S.ANALYZED if latest_analysis(db, clip) else S.DOWNLOADED
+    else:
+        target = S.DISCOVERED
+    clip.step_attempts, clip.download_attempts, clip.next_attempt_at, clip.error, clip.locked_until = 0, 0, None, None, None
+    clip.waiting_since = None
+    events.transition(db, "clip", clip, target, "retry manuale")

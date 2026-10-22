@@ -1,0 +1,22 @@
+{
+  "canvas_width": 1080,
+  "canvas_height": 1920,
+  "landscape_mode": "crop",
+  "crop_offset_x": 0.0,
+  "crop_offset_y": 0.0,
+  "font_file": "DejaVuSans-Bold.ttf",
+  "font_size": 88,
+  "min_font_size": 44,
+  "text_color": "#FFFFFF",
+  "stroke_color": "#000000",
+  "stroke_width": 6,
+  "shadow": true,
+  "align": "center",
+  "max_lines": 3,
+  "max_width_percent": 86,
+  "y_percent": 50,
+  "vertical_offset": 0,
+  "duration": {"mode": "full", "seconds": 3.0, "start": 0.0, "end": 3.0},
+  "fade_in": 0.25,
+  "fade_out": 0.25
+}
