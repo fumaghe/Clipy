@@ -58,6 +58,12 @@ def reject(db: Session, clip_id: str, actor: str = "owner", note: str | None = N
 def edit_content(db: Session, clip_id: str, *, overlay_title: str | None, caption: str | None, hashtags: list[str] | None,
                  approve_after: bool = False, actor: str = "owner") -> Clip:
     clip = get_clip(db, clip_id)
+    with pipeline.exclusive(db, clip):  # atomico rispetto al worker: nessun render/analisi in volo sulla stessa clip
+        return _edit_content(db, clip, overlay_title=overlay_title, caption=caption, hashtags=hashtags, approve_after=approve_after, actor=actor)
+
+
+def _edit_content(db: Session, clip: Clip, *, overlay_title: str | None, caption: str | None, hashtags: list[str] | None,
+                  approve_after: bool, actor: str) -> Clip:
     st = ss.get_settings(db)
     changes: dict = {}
     if overlay_title is not None:
@@ -74,6 +80,7 @@ def edit_content(db: Session, clip_id: str, *, overlay_title: str | None, captio
         changes["hashtags"] = clip.hashtags
     if not changes:
         return clip
+    pipeline.assert_reprocessable(db, clip)  # niente nuova versione (= secondo post) per un contenuto già pianificato/pubblicato
     clip.content_version += 1
     clip.human_edited = True
     clip.approve_after_render = approve_after
@@ -94,7 +101,10 @@ def edit_content(db: Session, clip_id: str, *, overlay_title: str | None, captio
 
 def regenerate(db: Session, clip_id: str) -> Clip:
     clip = get_clip(db, clip_id)
-    pipeline.regenerate_content(db, clip)
+    with pipeline.exclusive(db, clip):
+        pipeline.assert_reprocessable(db, clip)
+        pipeline.snapshot_content(db, clip, "contenuto precedente conservato prima della rigenerazione")
+        pipeline.regenerate_content(db, clip)
     return clip
 
 

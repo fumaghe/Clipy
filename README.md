@@ -44,4 +44,4 @@ scripts/run-tests.sh --e2e    # + Playwright (backend reale in demo)
 ```
 
 ## Documentazione
-`docs/LIVE_TEST_CHECKLIST.md` · `ARCHITECTURE.md` · `docs/DECISIONS.md` · `docs/INTEGRATIONS.md` · `docs/OPERATIONS.md` · `docs/TEST_REPORT.md` · `docs/TEMPLATE_REFERENCE.md` · `IMPLEMENTATION_PROGRESS.md`
+`docs/STEP_2_1_WINDOWS_DEMO_FIXES.md` · `docs/LIVE_TEST_CHECKLIST.md` · `ARCHITECTURE.md` · `docs/DECISIONS.md` · `docs/INTEGRATIONS.md` · `docs/OPERATIONS.md` · `docs/TEST_REPORT.md` · `docs/TEMPLATE_REFERENCE.md` · `IMPLEMENTATION_PROGRESS.md`

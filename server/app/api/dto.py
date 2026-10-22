@@ -126,6 +126,9 @@ class ClipDTO(_Base):
     review_reasons: list[Any] = []
     publication_status: str | None = None
     publication_due_at: datetime | None = None
+    busy: bool = False  # analisi/render/lock attivi: i comandi che modificano la clip rispondono 409 `busy`
+    busy_reason: str | None = None
+    pending: bool = False  # in attesa nella pipeline automatica (download/analisi/render non ancora conclusi)
 
 
 def clip_dto(db: Session, c: Clip) -> ClipDTO:
@@ -144,6 +147,9 @@ def clip_dto(db: Session, c: Clip) -> ClipDTO:
     d.review_reasons = r.reasons if r else []
     d.publication_status = j.status if j else None
     d.publication_due_at = j.due_at if j else None
+    d.busy_reason = pipeline.busy_reason(c)
+    d.busy = d.busy_reason is not None
+    d.pending = c.status in S.CLIP_ACTIVE_PIPELINE
     return d
 
 

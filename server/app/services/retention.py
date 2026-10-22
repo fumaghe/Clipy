@@ -29,15 +29,23 @@ def cleanup(db: Session) -> dict:
         for attr in ("original_path", "render_path"):
             p = getattr(c, attr)
             if p and Path(p).exists():
-                freed += Path(p).stat().st_size
-                Path(p).unlink()
+                size = Path(p).stat().st_size
+                try:
+                    Path(p).unlink()
+                except OSError as exc:  # Windows: file ancora aperto da uno streaming in corso (WinError 32) → riprova al prossimo ciclo
+                    events.emit(db, "retention", "file_in_use", f"File in uso, rimozione rinviata: {Path(p).name} ({type(exc).__name__})", severity="warning", clip_id=c.id)
+                    continue
+                freed += size
                 removed += 1
             setattr(c, attr, None)
     env = get_env()
     for sub in ("temp", "previews"):  # file temporanei/anteprime più vecchi di 2 giorni
         for f in env.dir(sub).glob("*"):
-            if f.is_file() and time.time() - f.stat().st_mtime > 2 * 86400:
-                f.unlink(missing_ok=True)
+            try:
+                if f.is_file() and time.time() - f.stat().st_mtime > 2 * 86400:
+                    f.unlink(missing_ok=True)
+            except OSError:  # file in uso su Windows: lo rimuove il prossimo ciclo
+                continue
     from app.services import housekeeping
 
     housekeeping.cleanup_stale_files()  # parziali orfani (.part) di download/render interrotti

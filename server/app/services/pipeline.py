@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from app.adapters.ai.base import AnalysisContext, Transcript
 from app.adapters.video import ffmpeg
 from app.adapters.video.renderer import FFmpegRenderer, fingerprint
 from app.core.config import get_env
-from app.core.errors import ClipyError, PermanentError, TemporaryError
+from app.core.errors import ClipyError, Conflict, PermanentError, TemporaryError
 from app.core.timeutil import utcnow
 from app.db.models import Analysis, Clip, PublicationJob, RenderJob, Review, Template
 from app.domain import review_gate
@@ -219,11 +221,106 @@ def active_template(db: Session, clip: Clip) -> tuple[Template, TemplateConfig]:
 def invalidate_render(db: Session, clip: Clip, *, to_status: str = S.ANALYZED) -> None:
     """Invalida render e job locali dipendenti (senza toccare il sorgente)."""
     clip.render_path, clip.render_fingerprint = None, None
-    for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == clip.id, PublicationJob.status.in_([S.QUEUED_LOCAL, S.RETRY_PENDING, S.DRY_RUN_OK]))):
+    for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == clip.id, PublicationJob.status.in_(S.PUB_LOCAL_CANCELLABLE))):
         events.transition(db, "publication", j, S.CANCELLED, "contenuto modificato")
     if clip.status not in (S.REJECTED, S.SKIPPED, S.FAILED) or to_status == S.ANALYZED:
         events.transition(db, "clip", clip, to_status, "render invalidato")
     db.flush()
+
+
+# ---------------------------------------------------------------- reprocessing esplicito (rianalisi / re-render)
+def busy_reason(clip: Clip) -> str | None:
+    """Motivo per cui la clip NON accetta comandi che la modificano (None = libera). Fonte unica per API e DTO."""
+    if clip.status == S.ANALYZING:
+        return "Analisi in corso"
+    if clip.status == S.RENDERING:
+        return "Render in corso"
+    if clip.locked_until is not None and clip.locked_until > utcnow():
+        return "Elaborazione in corso"
+    return None
+
+
+def busy_reason_status(clip: Clip) -> str | None:
+    """Come `busy_reason` ma ignorando il lock di riga (che `exclusive` ha appena preso noi stessi)."""
+    return {S.ANALYZING: "Analisi in corso", S.RENDERING: "Render in corso"}.get(clip.status)
+
+
+@contextmanager
+def exclusive(db: Session, clip: Clip) -> Iterator[Clip]:
+    """Sezione critica su una clip: lock di riga (stesso del worker) + commit atomico delle modifiche.
+
+    Il worker non può avanzare la clip mentre l'API la modifica e viceversa. Se la clip è già in elaborazione →
+    409 `busy` (previsto, non è un guasto). In caso di errore la transazione viene annullata per intero."""
+    cid = clip.id
+    if not leases.lock_row(db, Clip, cid, 300):
+        raise Conflict("La clip è già in elaborazione: attendi che finisca e riprova", code="busy")
+    try:
+        db.refresh(clip)
+        reason = busy_reason_status(clip)
+        if reason:
+            raise Conflict(f"{reason}: attendi che finisca e riprova", code="busy")
+        yield clip
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    finally:
+        leases.unlock_row(db, Clip, cid)
+
+
+def assert_reprocessable(db: Session, clip: Clip) -> None:
+    """Un contenuto già inviato (o possibilmente inviato) al provider non si rianalizza né si ri-renderizza:
+    il nuovo content_version genererebbe un secondo post della stessa clip."""
+    live = db.scalar(select(PublicationJob).where(
+        PublicationJob.clip_id == clip.id, PublicationJob.status != S.CANCELLED,
+        or_(PublicationJob.status.in_(S.PUB_REMOTE_LIVE), PublicationJob.remote_post_id.is_not(None), PublicationJob.locked_until > utcnow())))
+    if live is not None:
+        raise Conflict("La clip è già in pubblicazione, pianificata o pubblicata: non si può rielaborare senza creare un duplicato", code="publication_locked")
+
+
+def snapshot_content(db: Session, clip: Clip, note: str) -> None:
+    """Conserva titolo/caption/hashtag correnti (anche se modificati a mano) prima che una rielaborazione li sostituisca."""
+    if not (clip.overlay_title or clip.caption):
+        return
+    db.add(Review(clip_id=clip.id, policy_version="reprocess", review_state=clip.status, actor="system", note=note, reviewed_at=utcnow(),
+                  changes={"previous": {"overlay_title": clip.overlay_title, "caption": clip.caption, "hashtags": list(clip.hashtags or []),
+                                        "content_version": clip.content_version, "human_edited": clip.human_edited}}))
+
+
+def reprocess(db: Session, clip: Clip, *, stage: str, template_id: str | None = None) -> Clip:
+    """Rianalisi (`stage="analyze"`: → DOWNLOADED) o nuovo render (`stage="render"`: → ANALYZED) di una clip già elaborata.
+
+    Atomico (lock di riga + una sola transazione), idempotente (una richiesta ripetuta mentre la clip è già in coda non fa nulla),
+    senza duplicati (vedi `assert_reprocessable`) e senza perdite: analisi, review, file e testi precedenti restano.
+    I job locali/simulati vengono annullati; quando la clip torna idonea la coda ne crea uno nuovo per la nuova versione."""
+    if stage not in ("analyze", "render"):
+        raise ValueError(stage)
+    target = S.DOWNLOADED if stage == "analyze" else S.ANALYZED
+    with exclusive(db, clip) as c:
+        if c.status not in S.CLIP_REPROCESSABLE:
+            if stage == "analyze" and c.status in (S.DISCOVERED, S.WAITING_FOR_MEDIA):
+                raise Conflict("Originale non scaricato: usa Retry", code="no_original")
+            return c  # già nella coda di elaborazione automatica: richiesta ripetuta = no-op
+        if stage == "analyze" and not (c.original_path and Path(c.original_path).exists()):
+            raise Conflict("Originale non scaricato: usa Retry", code="no_original")
+        if stage == "render" and not latest_analysis(db, c):
+            raise Conflict("Esegui prima l'analisi", code="no_analysis")
+        assert_reprocessable(db, c)
+        if template_id is not None:
+            c.template_id = template_id
+        if stage == "analyze":
+            snapshot_content(db, c, "contenuto precedente conservato prima della rianalisi")
+            c.approve_after_render = False
+        elif c.status == S.APPROVED:
+            c.approve_after_render, c.human_edited = True, True  # il nuovo render riconferma l'approvazione umana
+        c.render_path, c.render_fingerprint = None, None
+        c.content_version += 1  # nuovo file di render (mai sovrascritto in uso) e nuovo job per la nuova versione
+        for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == c.id, PublicationJob.status.in_(S.PUB_LOCAL_CANCELLABLE))):
+            events.transition(db, "publication", j, S.CANCELLED, f"reprocessing ({stage})")
+        c.error, c.step_attempts, c.next_attempt_at = None, 0, None
+        events.transition(db, "clip", c, target, f"reprocess:{stage}")
+        events.emit(db, "pipeline", "reprocess", f"Reprocessing richiesto ({stage}): {target}", clip_id=c.id)
+    return clip
 
 
 def step_render(db: Session, clip: Clip) -> None:
@@ -326,6 +423,9 @@ def advance_one(db: Session) -> bool:
     try:
         clip = db.get(Clip, cid)
         assert clip is not None
+        db.refresh(clip)
+        if clip.status != status or clip.paused:  # l'API ha cambiato stato tra la selezione e il lock: nulla da fare, si riseleziona
+            return True
         if status in (S.DISCOVERED, S.WAITING_FOR_MEDIA):
             step_download(db, clip)
         elif status in (S.DOWNLOADED, S.ANALYZING):

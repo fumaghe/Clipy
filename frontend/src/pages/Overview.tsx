@@ -74,7 +74,7 @@ export function Overview() {
             <div className="grid grid-cols-3 gap-3 md:grid-cols-6">
               {recent.data.items.map((cl) => (
                 <Link key={cl.id} to="/library" className="space-y-1">
-                  <Thumb id={cl.id} kind={cl.has_render ? "render" : "original"} className="aspect-[9/16] w-full rounded-lg" />
+                  <Thumb clip={cl} className="aspect-[9/16] w-full rounded-lg" />
                   <StatusBadge status={cl.status} />
                 </Link>
               ))}

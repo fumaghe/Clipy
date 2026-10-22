@@ -86,7 +86,9 @@ def test_live_failure_and_recovery_paths_use_only_legal_transitions(db):
 
 def test_publisher_job_states_never_leave_published(db):
     assert S.is_legal("publication", S.QUEUED_LOCAL, S.SCHEDULING) and not S.is_legal("publication", S.PUBLISHED, S.QUEUED_LOCAL)
-    assert not S.is_legal("clip", S.AUTO_READY, S.DOWNLOADED) and S.is_legal("clip", S.FAILED, S.DOWNLOADED)
+    # STEP 2.1: AUTO_READY → DOWNLOADED è ora la rianalisi ESPLICITA (`pipeline.reprocess`), non più una transizione «non prevista»
+    assert S.is_legal("clip", S.AUTO_READY, S.DOWNLOADED) and S.is_legal("clip", S.FAILED, S.DOWNLOADED)
+    assert not S.is_legal("clip", S.AUTO_READY, S.DISCOVERED) and not S.is_legal("clip", S.AUTO_READY, S.WAITING_FOR_MEDIA)
 
 
 # ------------------------------------------------------------ scheduling

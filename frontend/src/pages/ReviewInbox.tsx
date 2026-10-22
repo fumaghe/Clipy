@@ -24,8 +24,8 @@ function ReviewCard({ item }: { item: ReviewItem }) {
     <Card>
       <div className="grid gap-4 lg:grid-cols-[auto_1fr]">
         <div className="grid grid-cols-2 gap-2 lg:w-[360px]">
-          <div><div className="label">Originale</div>{item.has_original ? <Video id={item.id} kind="original" className="aspect-[9/16] w-full object-contain" /> : <p className="text-xs text-zinc-500">n/d</p>}</div>
-          <div><div className="label">Render finale</div>{item.has_render ? <Video id={item.id} kind="render" className="aspect-[9/16] w-full object-contain" /> : <p className="text-xs text-amber-300">Render in corso…</p>}</div>
+          <div><div className="label">Originale</div>{item.has_original ? <Video id={item.id} kind="original" version={item.content_version} className="aspect-[9/16] w-full object-contain" /> : <p className="text-xs text-zinc-500">n/d</p>}</div>
+          <div><div className="label">Render finale</div>{item.has_render ? <Video id={item.id} kind="render" version={item.content_version} className="aspect-[9/16] w-full object-contain" /> : <p className="text-xs text-amber-300">{item.busy_reason ?? "Render in corso…"}</p>}</div>
         </div>
         <div className="space-y-3 text-sm">
           <div className="flex flex-wrap items-center gap-2"><Badge tone="amber">Da rivedere</Badge>{item.is_demo && <SimBadge />}<span className="text-zinc-500">{item.game_name} · {item.creator_name}</span></div>
@@ -42,13 +42,14 @@ function ReviewCard({ item }: { item: ReviewItem }) {
           </div>
           <Field label="Caption TikTok"><textarea className="input h-20" value={caption} onChange={(e) => setCaption(e.target.value)} /></Field>
           <div className="flex flex-wrap gap-2">
-            <Button variant="success" busy={approve.isPending} disabled={!item.has_render || dirty} onClick={() => approve.mutate()}><Check className="h-3.5 w-3.5" />Approva</Button>
-            <Button variant="ghost" busy={save.isPending} disabled={!dirty} onClick={() => save.mutate(true)}>Modifica e approva</Button>
-            <Button variant="ghost" busy={save.isPending} disabled={!dirty} onClick={() => save.mutate(false)}>Salva modifiche</Button>
-            <Button variant="ghost" busy={regen.isPending} onClick={() => regen.mutate()}><RefreshCw className="h-3.5 w-3.5" />Rigenera</Button>
-            <Button variant="ghost" busy={rerender.isPending} onClick={() => rerender.mutate()}>Riprova render</Button>
+            <Button variant="success" busy={approve.isPending} disabled={!item.has_render || dirty || item.busy} onClick={() => approve.mutate()}><Check className="h-3.5 w-3.5" />Approva</Button>
+            <Button variant="ghost" busy={save.isPending} disabled={!dirty || item.busy} onClick={() => save.mutate(true)}>Modifica e approva</Button>
+            <Button variant="ghost" busy={save.isPending} disabled={!dirty || item.busy} onClick={() => save.mutate(false)}>Salva modifiche</Button>
+            <Button variant="ghost" busy={regen.isPending} disabled={item.busy} title={item.busy_reason ?? undefined} onClick={() => regen.mutate()}><RefreshCw className="h-3.5 w-3.5" />Rigenera</Button>
+            <Button variant="ghost" busy={rerender.isPending} disabled={item.busy} title={item.busy_reason ?? undefined} onClick={() => rerender.mutate()}>Riprova render</Button>
             <Button variant="danger" busy={reject.isPending} onClick={() => reject.mutate()}><Trash2 className="h-3.5 w-3.5" />Scarta</Button>
           </div>
+          {item.busy && <p className="text-xs text-amber-300" role="status">⏳ {item.busy_reason}: i comandi che modificano la clip sono disattivati fino al termine.</p>}
           {dirty && <p className="text-xs text-zinc-500">Salva le modifiche prima di approvare: l'approvazione riguarda il render attuale.</p>}
         </div>
       </div>

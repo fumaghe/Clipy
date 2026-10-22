@@ -52,6 +52,9 @@ Suite backend (pytest), frontend (vitest), e2e Playwright, script di test, docum
 | 9 Test | vedi `docs/TEST_REPORT.md` |
 | 10 Documentazione | [DONE] incl. `docs/LIVE_TEST_CHECKLIST.md` |
 
+## STEP 2.1 — Correzioni dalla demo su Windows · [DONE in sandbox, da riverificare su Windows]
+WinError 10054 (player a richiesta, HEAD, filtro mirato dei reset del client, file aperti su Windows) · preview 404 (placeholder per stato, `media_not_ready`) · reprocessing esplicito/atomico/senza duplicati (`AUTO_READY → DOWNLOADED`) · 409 `busy` previsto con comandi disattivati in UI. Dettagli: `docs/STEP_2_1_WINDOWS_DEMO_FIXES.md`. DRY RUN invariato, nessun dato eliminato.
+
 ## Prossime attività (richiedono te) — dettaglio in `docs/LIVE_TEST_CHECKLIST.md`
 1. Primo avvio su Windows con `start-clipy.bat` e verifica degli script.
 2. Registrare l'app Twitch, autorizzare `iDensTv`, importare clip reali.

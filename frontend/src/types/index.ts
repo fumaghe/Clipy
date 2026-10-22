@@ -30,6 +30,9 @@ export interface Clip {
   review_reasons: { code: string; message: string }[];
   publication_status: string | null;
   publication_due_at: string | null;
+  busy: boolean;
+  busy_reason: string | null;
+  pending: boolean;
 }
 
 export interface ReviewItem extends Clip {

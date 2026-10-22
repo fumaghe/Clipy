@@ -33,6 +33,32 @@ def install_log_sanitizer() -> None:
 
 
 install_log_sanitizer()
+
+
+class ClientDisconnectFilter(logging.Filter):
+    """asyncio (soprattutto ProactorEventLoop su Windows) registra come ERROR `ConnectionResetError: [WinError 10054]`
+    quando il BROWSER chiude un socket durante lo streaming (seek del player, preload annullato, modale chiusa).
+    Non è un guasto del server: l'unico caso filtrato è un'eccezione di tipo reset/abort/broken-pipe emessa dal logger `asyncio`
+    dai callback del transport; viene riportata a DEBUG. Qualunque altra eccezione (o altro messaggio) passa invariata."""
+
+    _TRANSPORT_HINTS = ("_call_connection_lost", "_ProactorBasePipeTransport", "_SelectorSocketTransport", "Fatal read error", "Fatal write error")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if isinstance(exc, ConnectionResetError | ConnectionAbortedError | BrokenPipeError) and any(h in record.getMessage() for h in self._TRANSPORT_HINTS):
+            record.levelno, record.levelname = logging.DEBUG, "DEBUG"
+            record.msg, record.args, record.exc_info, record.exc_text = "Connessione chiusa dal client durante lo streaming (normale)", (), None, None
+            return logging.getLogger("asyncio").isEnabledFor(logging.DEBUG)
+        return True
+
+
+def install_client_disconnect_filter() -> None:
+    lg = logging.getLogger("asyncio")
+    if not any(isinstance(f, ClientDisconnectFilter) for f in lg.filters):
+        lg.addFilter(ClientDisconnectFilter())
+
+
+install_client_disconnect_filter()
 logging.getLogger("alembic").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -111,7 +137,8 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(ClipyError)
     async def _clipy(_: Request, exc: ClipyError):
-        return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message}})
+        headers = {"Cache-Control": "no-store"} if exc.code == "media_not_ready" else None
+        return JSONResponse(status_code=exc.status_code, headers=headers, content={"error": {"code": exc.code, "message": exc.message}})
 
     @app.exception_handler(RequestValidationError)
     async def _validation(_: Request, exc: RequestValidationError):

@@ -261,7 +261,10 @@ class HttpDownloader:
                     raise TemporaryError(f"Download incompleto ({total}/{declared} byte)", code="download_incomplete")
             if total == 0:
                 raise TemporaryError("Download vuoto", code="download_incomplete")
-            part.replace(dest)
+            try:
+                part.replace(dest)
+            except PermissionError as exc:  # Windows: l'originale è aperto (es. streaming nella dashboard)
+                raise TemporaryError("File originale in uso: riprovo il download più tardi", code="download_file_busy") from exc
         except httpx.HTTPError as exc:
             raise TemporaryError(f"Download interrotto: {type(exc).__name__}", code="download_network") from exc
         finally:

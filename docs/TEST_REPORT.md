@@ -58,3 +58,18 @@ Tutti i risultati sotto sono **reali** (eseguiti con `scripts/run-tests.sh --e2e
 - Il test del crash del render simula l'interruzione sollevando `KeyboardInterrupt` al posto di `ffmpeg`; non uccide un processo reale.
 - La concorrenza è verificata deterministicamente (stato obsoleto) e non con vere istanze parallele.
 - I contenuti degli script PowerShell non sono stati interpretati da PowerShell.
+
+---
+## Addendum STEP 2.1 — correzioni demo Windows (22/10/2026, sandbox Linux)
+Dettagli e diagnosi in `docs/STEP_2_1_WINDOWS_DEMO_FIXES.md`.
+
+| Suite | Esito |
+|---|---|
+| `ruff check app` | OK |
+| `pytest app/tests` | **246 passed** (231 + 15 nuovi in `test_windows_demo_fixes.py`); una asserzione di `test_state_machine.py` aggiornata di proposito: documentava come «non prevista» proprio la transizione `AUTO_READY → DOWNLOADED`, ora dichiarata (rianalisi esplicita) |
+| `tsc` / `eslint` / `vite build` | OK |
+| `vitest` | **14 passed** (9 + 5 nuovi in `media.test.tsx`) |
+| `playwright` (demo, backend reale) | **13 passed** |
+
+Bug emersi dai nuovi test: `HEAD` su `/video` e `/preview` rispondeva 405; la rianalisi da `REJECTED/SKIPPED` era un no-op silenzioso; la modifica testi su una clip già pianificata creava una nuova versione (⇒ secondo post).
+**Non verificabile in sandbox:** il `ProactorEventLoop` di Windows (il filtro è testato con record sintetici e il server con RST reali su Linux); script `.bat/.ps1`.

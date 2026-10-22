@@ -90,40 +90,31 @@ def patch_clip(clip_id: str, body: PatchBody, db: Session = DB) -> dict:
 
         get_template(db, body.template_id)
         if c.template_id != body.template_id:
-            c.template_id = body.template_id
             if c.status in (S.AUTO_READY, S.APPROVED, S.NEEDS_REVIEW):
-                _rerender(db, c)
+                _reprocess(db, c, "render", template_id=body.template_id)  # cambio template + re-render nella stessa transazione
+            else:
+                c.template_id = body.template_id
     return clip_dto(db, c).model_dump(mode="json")
 
 
-def _rerender(db: Session, c: Clip) -> None:
-    if c.status == S.APPROVED:
-        c.approve_after_render, c.human_edited = True, True
-    pipeline.invalidate_render(db, c)
+def _reprocess(db: Session, c: Clip, stage: str, *, template_id: str | None = None) -> None:
+    pipeline.reprocess(db, c, stage=stage, template_id=template_id)
     runner.process_in_background()
 
 
 @router.post("/{clip_id}/analyze")
 def analyze(clip_id: str, db: Session = DB) -> dict:
+    """Rianalisi esplicita (AUTO_READY/NEEDS_REVIEW/APPROVED/… → DOWNLOADED). 409 `busy` se la clip è già in elaborazione."""
     c = reviews.get_clip(db, clip_id)
-    if not c.original_path or not Path(c.original_path).exists():
-        raise Conflict("Originale non scaricato: usa Retry", code="no_original")
-    if c.status in (S.ANALYZING, S.RENDERING):
-        raise Conflict("Clip già in elaborazione", code="busy")
-    pipeline.invalidate_render(db, c, to_status=S.DOWNLOADED)
-    c.error, c.step_attempts = None, 0
-    runner.process_in_background()
+    _reprocess(db, c, "analyze")
     return clip_dto(db, c).model_dump(mode="json")
 
 
 @router.post("/{clip_id}/render")
 def render(clip_id: str, db: Session = DB) -> dict:
+    """Nuovo render sull'analisi esistente. 409 `busy` (previsto) se un'analisi o un render sono già attivi sulla clip."""
     c = reviews.get_clip(db, clip_id)
-    if not pipeline.latest_analysis(db, c):
-        raise Conflict("Esegui prima l'analisi", code="no_analysis")
-    if c.status in (S.ANALYZING, S.RENDERING):
-        raise Conflict("Clip già in elaborazione", code="busy")
-    _rerender(db, c)
+    _reprocess(db, c, "render")
     return clip_dto(db, c).model_dump(mode="json")
 
 
@@ -140,9 +131,10 @@ def retry(clip_id: str, db: Session = DB) -> dict:
 @router.post("/{clip_id}/skip")
 def skip(clip_id: str, db: Session = DB) -> dict:
     c = reviews.get_clip(db, clip_id)
-    for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == c.id, PublicationJob.status.in_([S.QUEUED_LOCAL, S.RETRY_PENDING, S.DRY_RUN_OK]))):
-        events.transition(db, "publication", j, S.CANCELLED, "clip saltata")
-    events.transition(db, "clip", c, S.SKIPPED, "saltata dall'utente")
+    with pipeline.exclusive(db, c):  # una clip in render non può essere saltata a metà: il worker la riporterebbe in coda
+        for j in db.scalars(select(PublicationJob).where(PublicationJob.clip_id == c.id, PublicationJob.status.in_(S.PUB_LOCAL_CANCELLABLE))):
+            events.transition(db, "publication", j, S.CANCELLED, "clip saltata")
+        events.transition(db, "clip", c, S.SKIPPED, "saltata dall'utente")
     return clip_dto(db, c).model_dump(mode="json")
 
 
@@ -156,23 +148,31 @@ def add_to_queue(clip_id: str, db: Session = DB) -> dict:
     return clip_dto(db, c).model_dump(mode="json")
 
 
+class MediaNotReady(NotFound):
+    """Il file non è ancora stato scaricato/generato: stato normale della pipeline, NON un errore applicativo.
+
+    Il 404 resta il codice HTTP corretto, ma `Cache-Control: no-store` evita che il browser lo memorizzi
+    (la stessa URL tra pochi secondi sarà valida) e il codice `media_not_ready` lo distingue da un file perso."""
+    code = "media_not_ready"
+
+
 def _file(c: Clip, kind: str) -> Path:
     path = c.render_path if kind == "render" else c.original_path
     if not path or not Path(path).exists():
-        raise NotFound("File non disponibile", code="file_not_found")
+        raise MediaNotReady("File non ancora disponibile" if c.status in S.CLIP_ACTIVE_PIPELINE else "File non disponibile")
     p = Path(path).resolve()
     if get_env().data_dir.resolve() not in p.parents:  # solo file sotto data/
         raise NotFound("File non disponibile", code="file_not_found")
     return p
 
 
-@router.get("/{clip_id}/video")
+@router.api_route("/{clip_id}/video", methods=["GET", "HEAD"])  # HEAD: alcuni player/estensioni sondano dimensione e Range prima di riprodurre
 def video(clip_id: str, kind: str = Query("render", pattern="^(render|original)$"), db: Session = DB):
     c = reviews.get_clip(db, clip_id)
     return FileResponse(_file(c, kind), media_type="video/mp4", filename=f"{c.source_clip_id}-{kind}.mp4", content_disposition_type="inline")
 
 
-@router.get("/{clip_id}/preview")
+@router.api_route("/{clip_id}/preview", methods=["GET", "HEAD"])
 def preview(clip_id: str, kind: str = Query("render", pattern="^(render|original)$"), db: Session = DB):
     c = reviews.get_clip(db, clip_id)
     try:

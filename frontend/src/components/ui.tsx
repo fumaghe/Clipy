@@ -118,13 +118,14 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 }
 
 // ---- toast
-type Toast = { id: number; text: string; tone: "ok" | "err" };
-const ToastCtx = createContext<(text: string, tone?: "ok" | "err") => void>(() => {});
+type ToastTone = "ok" | "err" | "warn";
+type Toast = { id: number; text: string; tone: ToastTone };
+const ToastCtx = createContext<(text: string, tone?: ToastTone) => void>(() => {});
 export const useToast = () => useContext(ToastCtx);
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, setItems] = useState<Toast[]>([]);
-  const push = useCallback((text: string, tone: "ok" | "err" = "ok") => {
+  const push = useCallback((text: string, tone: ToastTone = "ok") => {
     const id = Date.now() + Math.random();
     setItems((x) => [...x, { id, text, tone }]);
     setTimeout(() => setItems((x) => x.filter((t) => t.id !== id)), 5000);
@@ -134,7 +135,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       {children}
       <div className="fixed bottom-4 right-4 z-[60] flex max-w-sm flex-col gap-2" aria-live="polite">
         {items.map((t) => (
-          <div key={t.id} className={`rounded-lg border px-3 py-2 text-sm shadow-lg ${t.tone === "ok" ? "border-emerald-500/40 bg-emerald-950 text-emerald-100" : "border-red-500/40 bg-red-950 text-red-100"}`}>{t.text}</div>
+          <div key={t.id} className={`rounded-lg border px-3 py-2 text-sm shadow-lg ${{ ok: "border-emerald-500/40 bg-emerald-950 text-emerald-100", warn: "border-amber-500/40 bg-amber-950 text-amber-100", err: "border-red-500/40 bg-red-950 text-red-100" }[t.tone]}`}>{t.text}</div>
         ))}
       </div>
     </ToastCtx.Provider>
