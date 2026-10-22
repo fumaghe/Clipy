@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDown, ArrowUp, Ban, Pause, Play, Send } from "lucide-react";
 import { useState } from "react";
-import { Badge, Button, Card, EmptyState, ErrorState, Field, Modal, PageHeader, SimBadge, Spinner, StatusBadge } from "../components/ui";
+import { Badge, Button, Card, EmptyState, ErrorState, Field, Modal, PageHeader, RemoteStateBadge, SimBadge, Spinner, StatusBadge } from "../components/ui";
 import { useAction } from "../hooks/useApi";
 import { get, patch, post } from "../lib/api";
 import { dayKey, fmtDay, fmtTime } from "../lib/format";
@@ -32,6 +32,7 @@ function Row({ j, prev, next }: { j: Job; prev?: Job; next?: Job }) {
         <StatusBadge status={j.status} />
         {j.paused && <Badge tone="amber">In pausa</Badge>}
         {j.simulated && <SimBadge />}
+        {!j.simulated && <RemoteStateBadge state={j.remote_state} />}
         <Badge tone={["SCHEDULED_REMOTE", "PUBLISHED"].includes(j.status) ? "violet" : "zinc"}>{["SCHEDULED_REMOTE", "PUBLISHED"].includes(j.status) ? "REMOTE" : "LOCAL"}</Badge>
       </div>
       <div className="flex gap-1">

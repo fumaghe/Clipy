@@ -54,7 +54,13 @@ def step_download(db: Session, clip: Clip) -> None:
         clip.landscape_fallback = not use_portrait
         dest = get_env().dir("originals") / f"{clip.id}.mp4"
         dl.download(url, dest, tw.max_download_mb * 1024 * 1024)
-        info = ffmpeg.probe(dest)  # valida integrità
+        try:
+            info = ffmpeg.probe(dest)  # valida integrità: un file troncato/corrotto NON è un video valido
+        except PermanentError as exc:
+            dest.unlink(missing_ok=True)
+            if exc.code == "ffprobe_missing":
+                raise
+            raise TemporaryError(f"File scaricato incompleto o corrotto, lo riscarico: {exc.message}", code="download_corrupt") from exc
         if info["duration"] < 1:
             dest.unlink(missing_ok=True)
             raise PermanentError("Clip troppo corta o corrotta", code="bad_media")
@@ -93,7 +99,7 @@ def build_context(db: Session, clip: Clip, transcript: Transcript, frames: list[
     return AnalysisContext(
         clip_title=clip.title, game_name=clip.game_name, transcript=transcript, frames=frames, duration=clip.duration, language=ai.language,
         tone=ai.tone, prompt_extra=ai.prompt_extra, banned_words=ai.banned_words, max_emoji=ai.max_emoji, max_hashtags=ai.max_hashtags,
-        max_overlay_chars=ai.max_overlay_chars, avoid_titles=avoid or [], variation=variation,
+        max_overlay_chars=ai.max_overlay_chars, avoid_titles=avoid or [], variation=variation, budget_usd=ai.budget_usd_per_clip,
         demo_fixture=(clip.media_info or {}).get("demo_fixture") if clip.is_demo else None)
 
 
@@ -148,17 +154,39 @@ def step_analyze(db: Session, clip: Clip) -> None:
     except TemporaryError as exc:
         clip.step_attempts += 1
         events.emit(db, "ai", "analysis_retry", exc.message, severity="warning", clip_id=clip.id)
-        events.transition(db, "clip", clip, S.FAILED if clip.step_attempts >= MAX_STEP_ATTEMPTS else S.DOWNLOADED, exc.message)
         clip.error, clip.next_attempt_at = exc.message, utcnow() + backoff(clip.step_attempts)
+        if clip.step_attempts >= MAX_STEP_ATTEMPTS:
+            _analysis_fallback(db, clip, exc)  # provider irraggiungibile: la clip NON si perde, va in revisione
+        else:
+            events.transition(db, "clip", clip, S.DOWNLOADED, exc.message)
     except ClipyError as exc:
-        clip.error = exc.message
-        events.transition(db, "clip", clip, S.FAILED, exc.message)
-        events.emit(db, "ai", "analysis_failed", exc.message, severity="error", clip_id=clip.id)
+        if exc.code in ("ffmpeg_missing", "ffprobe_missing"):
+            clip.error = exc.message
+            events.transition(db, "clip", clip, S.FAILED, exc.message)
+            events.emit(db, "ai", "analysis_failed", exc.message, severity="error", clip_id=clip.id)
+        else:
+            _analysis_fallback(db, clip, exc)  # chiave rifiutata, budget, risposta non valida...: revisione con motivazione esplicita
     finally:
         for p in (get_env().dir("temp")).glob(f"frames-{clip.id}*"):
             import shutil
 
             shutil.rmtree(p, ignore_errors=True)
+
+
+def _analysis_fallback(db: Session, clip: Clip, exc: ClipyError) -> None:
+    """Analisi AI non riuscita: crea un'analisi descrittiva marcata `analysis_failed` così il flusso prosegue
+    (render → review gate → NEEDS_REVIEW con motivo) senza bloccare la coda né inventare contenuti."""
+    from app.adapters.ai.analyzers import fallback_result
+
+    last = latest_analysis(db, clip)
+    tr = Transcript(last.transcript, last.segments, last.language, last.asr_engine, last.asr_available, last.simulated) if last else \
+        Transcript("", [], "", "none", available=False, note="analisi non completata")
+    ctx = build_context(db, clip, tr, [])
+    res = fallback_result(ctx, f"{exc.message} [{exc.code}]")
+    _apply_analysis(db, clip, tr, [], res)
+    clip.error = None
+    events.transition(db, "clip", clip, S.ANALYZED, "analisi AI non riuscita: fallback → revisione")
+    events.emit(db, "ai", "analysis_fallback", f"Analisi AI non riuscita ({exc.code}): la clip andrà in revisione", severity="warning", clip_id=clip.id)
 
 
 def regenerate_content(db: Session, clip: Clip) -> None:
@@ -222,6 +250,13 @@ def step_render(db: Session, clip: Clip) -> None:
             checks, warnings = r.checks, r.warnings
             job.status, job.output_path, job.checks, job.warnings, job.finished_at = "DONE", str(out), checks, warnings, utcnow()
             clip.render_path, clip.render_fingerprint = str(out), fp
+        except TemporaryError as exc:  # es. timeout di ffmpeg: il processo è già stato terminato, si riprova più tardi
+            job.status, job.error, job.finished_at = "FAILED", exc.message, utcnow()
+            clip.step_attempts += 1
+            clip.error, clip.next_attempt_at = exc.message, utcnow() + backoff(clip.step_attempts)
+            events.transition(db, "clip", clip, S.FAILED if clip.step_attempts >= MAX_STEP_ATTEMPTS else S.ANALYZED, exc.message)
+            events.emit(db, "renderer", "render_retry", exc.message, severity="warning", clip_id=clip.id)
+            return
         except ClipyError as exc:
             job.status, job.error, job.finished_at = "FAILED", exc.message, utcnow()
             clip.error = exc.message
@@ -246,7 +281,8 @@ def run_gate(db: Session, clip: Clip, checks: dict, warnings: list[str]) -> None
         llm_requires_review=bool(s.get("requires_review")), llm_reason=s.get("reason"), quality_flags=(a.quality_flags if a else []),
         asr_available=a.asr_available if a else True, render_checks=checks, render_warnings=warnings, landscape_fallback=clip.landscape_fallback,
         max_caption_length=st.publishing.max_caption_length, banned_words=st.ai.banned_words, max_overlay_chars=st.ai.max_overlay_chars,
-        max_emoji=st.ai.max_emoji, recent_titles=_recent_titles(db, clip), simulated_scenario=clip.demo_scenario if clip.is_demo else "")
+        max_emoji=st.ai.max_emoji, recent_titles=_recent_titles(db, clip), simulated_scenario=clip.demo_scenario if clip.is_demo else "",
+        asr_disabled=bool(a and a.asr_engine == "off"), sensitive_terms=st.review.sensitive_terms)
     if inp.landscape_fallback and st.twitch.landscape_fallback == "review":
         inp.render_warnings = [*inp.render_warnings, "crop_unvalidated"]
     res = review_gate.evaluate(inp, st.review)
@@ -272,7 +308,7 @@ def next_clip_id(db: Session) -> tuple[str, str] | None:
     order = [S.RENDERING, S.ANALYZING, S.ANALYZED, S.DOWNLOADED, S.DISCOVERED, S.WAITING_FOR_MEDIA]
     for status in order:
         q = select(Clip.id).where(Clip.status == status, Clip.paused.is_(False), or_(Clip.locked_until.is_(None), Clip.locked_until < now))
-        if status in (S.DISCOVERED, S.WAITING_FOR_MEDIA, S.DOWNLOADED):
+        if status in (S.DISCOVERED, S.WAITING_FOR_MEDIA, S.DOWNLOADED, S.ANALYZED):
             q = q.where(or_(Clip.next_attempt_at.is_(None), Clip.next_attempt_at <= now))
         row = db.scalar(q.order_by(Clip.created_at_utc.asc()).limit(1))
         if row:

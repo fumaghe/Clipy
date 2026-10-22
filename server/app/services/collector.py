@@ -68,7 +68,9 @@ def scan(db: Session, *, now=None) -> dict:
             new += int(created)
         cur.last_successful_scan_at, cur.last_window_start = now, start
         cur.last_scan_found, cur.last_scan_new, cur.last_error = len(metas), new, None
-        events.emit(db, "collector", "scan_ok", f"Scansione {'iniziale (backfill)' if first_run else 'ricorrente'}: {len(metas)} clip nella finestra, {new} nuove" + (" [DEMO simulato]" if demo else ""))
+        bad = (getattr(source, "last_stats", None) or {}).get("malformed", 0)
+        events.emit(db, "collector", "scan_ok", f"Scansione {'iniziale (backfill)' if first_run else 'ricorrente'}: {len(metas)} clip nella finestra, {new} nuove"
+                    + (f", {bad} voci malformate ignorate" if bad else "") + (" [DEMO simulato]" if demo else ""), severity="warning" if bad else "info")
         db.commit()
         return {"found": len(metas), "new": new, "first_run": first_run, "simulated": demo}
     except (ClipyError, TemporaryError) as exc:

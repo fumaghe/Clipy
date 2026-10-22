@@ -7,5 +7,5 @@ const backend = process.env.CLIPY_BACKEND ?? "http://127.0.0.1:8000";
 export default defineConfig({
   plugins: [react()],
   server: { proxy: { "/api": backend, "/media": backend, "/health": backend } },
-  test: { environment: "jsdom", globals: true, setupFiles: ["./src/test-setup.ts"] },
+  test: { environment: "jsdom", globals: true, setupFiles: ["./src/test-setup.ts"], include: ["src/**/*.test.{ts,tsx}"] }, // e2e/*.spec.ts è di Playwright
 });

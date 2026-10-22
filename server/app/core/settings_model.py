@@ -34,7 +34,9 @@ class AISettings(BaseModel):
     vision_enabled: bool = False
     max_frames: int = Field(6, ge=1, le=16)
     frame_interval_seconds: int = Field(4, ge=1, le=15)
-    budget_usd_per_clip: float = Field(0.05, ge=0, le=5)
+    budget_usd_per_clip: float = Field(0.05, ge=0, le=5)  # 0 = nessun limite; stima PRIMA della chiamata (vision viene tolta se sfora)
+    llm_timeout_seconds: int = Field(60, ge=5, le=300)
+    asr_timeout_seconds: int = Field(600, ge=30, le=3600)
     max_overlay_chars: int = Field(60, ge=10, le=120)
 
 
@@ -43,13 +45,15 @@ class ReviewSettings(BaseModel):
     min_confidence: float = Field(0.6, ge=0, le=1)
     require_evidence: bool = True
     review_landscape_crop: bool = False
-    review_if_asr_unavailable: bool = False
+    review_if_asr_unavailable: bool = True  # ASR guasto/non installato ≠ ASR spento dall'utente: la clip va in revisione
+    sensitive_terms: list[str] = Field(default_factory=lambda: ["suicid", "stupr", "pedofil", "terroris", "nazis", "olocaust", "overdose", "autolesion", "self-harm", "rape"])
     detect_pii: bool = True
 
 
 class PublishingSettings(BaseModel):
     provider: Literal["buffer", "mock"] = "buffer"
     is_connected: bool = False
+    organization_id: str = ""  # Buffer: organizzazione che possiede il canale (necessaria per posts/channels)
     channel_id: str = ""
     policy: Literal["auto_with_review_gate"] = "auto_with_review_gate"
     live_enabled: bool = False

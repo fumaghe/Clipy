@@ -4,18 +4,19 @@ Trasforma automaticamente le clip Twitch di **iDensTv** in video TikTok vertical
 (faster-whisper), genera titolo overlay e caption con un LLM, renderizza un MP4 1080×1920 con FFmpeg secondo un template, e le mette in una coda persistente
 (fino a 4 post/giorno, configurabile) pubblicata via Buffer. Solo le clip **dubbie** vanno in revisione; le altre scorrono da sole.
 
-> **Stato:** V1.0. Funziona subito in **modalità demo** (Twitch/AI/publisher simulati e marcati `SIMULATO`). La pubblicazione reale è **disattivata** (`DRY RUN`) finché non
+> **Stato:** V1.1 (STEP 2: hardening integrazioni). Funziona subito in **modalità demo** (Twitch/AI/publisher simulati e marcati `SIMULATO`). La pubblicazione reale è **disattivata** (`DRY RUN`) finché non
 > la abiliti tu da Settings. Vedi `IMPLEMENTATION_PROGRESS.md` e `docs/TEST_REPORT.md` per cosa è verificato e cosa è *NON VALIDATO LIVE*.
 
 ## Requisiti
-- Python ≥ 3.11, Node ≥ 20, **FFmpeg + ffprobe** nel `PATH`
+- Python 3.11–3.13 (consigliato 3.12), Node ≥ 20, **FFmpeg + ffprobe** (build *full* con `drawtext`; trovati anche fuori dal `PATH`, vedi `CLIPY_FFMPEG_DIR`)
 - (opzionale) `pip install faster-whisper` per la trascrizione locale reale; GPU CUDA facoltativa (fallback CPU)
 
 ## Avvio rapido
 **Windows (PowerShell)**
 ```powershell
 winget install Gyan.FFmpeg Python.Python.3.12 OpenJS.NodeJS.LTS   # una tantum
-.\scripts\start-dev.ps1 -Prod      # oppure doppio clic su start-clipy.bat
+.\scripts\check-windows.ps1       # controlli preliminari (facoltativo, non modifica nulla)
+start-clipy.bat                   # controlla l'ambiente, avvia backend + frontend compilato e apre il browser (la finestra resta aperta)
 ```
 **Linux / macOS**
 ```bash
@@ -33,7 +34,7 @@ Singoli processi: backend `cd server && ../.venv/bin/python -m uvicorn app.main:
 `CLIPY_RUN_WORKER=true`; un solo leader per volta grazie a un lease nel DB), frontend `cd frontend && npm run dev`.
 
 ## Passare al reale (in ordine)
-Dettagli in `docs/INTEGRATIONS.md`. Riassunto: app Twitch + Client ID/Secret → autorizza `iDensTv` → chiave LLM → (opz.) `faster-whisper` → account Buffer + TikTok +
+**Guida passo-passo con risultati attesi e rimedi: [`docs/LIVE_TEST_CHECKLIST.md`](docs/LIVE_TEST_CHECKLIST.md).** Dettagli tecnici in `docs/INTEGRATIONS.md`. *Settings → Diagnostica integrazioni* mostra lo stato di ogni servizio (anche cosa è ancora simulato). Riassunto: app Twitch + Client ID/Secret → autorizza `iDensTv` → chiave LLM → (opz.) `faster-whisper` → account Buffer + TikTok +
 API key → bucket R2/S3 con URL pubblico → Settings → **Pubblicazione reale** (frase di conferma). Nessun post reale parte prima di quest'ultimo passo.
 
 ## Test
@@ -43,4 +44,4 @@ scripts/run-tests.sh --e2e    # + Playwright (backend reale in demo)
 ```
 
 ## Documentazione
-`ARCHITECTURE.md` · `docs/DECISIONS.md` · `docs/INTEGRATIONS.md` · `docs/OPERATIONS.md` · `docs/TEST_REPORT.md` · `docs/TEMPLATE_REFERENCE.md` · `IMPLEMENTATION_PROGRESS.md`
+`docs/LIVE_TEST_CHECKLIST.md` · `ARCHITECTURE.md` · `docs/DECISIONS.md` · `docs/INTEGRATIONS.md` · `docs/OPERATIONS.md` · `docs/TEST_REPORT.md` · `docs/TEMPLATE_REFERENCE.md` · `IMPLEMENTATION_PROGRESS.md`

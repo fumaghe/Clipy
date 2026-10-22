@@ -43,3 +43,16 @@ def lock_row(db: Session, model, row_id: str, seconds: int = 600) -> bool:
 def unlock_row(db: Session, model, row_id: str) -> None:
     db.execute(update(model).where(model.id == row_id).values(locked_until=None))
     db.commit()
+
+
+def recover_locks(db: Session) -> None:
+    """Rilascia i lock di riga orfani (clip e job). Da chiamare SOLO da chi è l'unico leader/processo attivo."""
+    from app.db.models import Clip, PublicationJob
+
+    db.execute(update(Clip).values(locked_until=None))
+    db.execute(update(PublicationJob).values(locked_until=None))
+
+
+def foreign_leader_alive(db: Session, owner: str) -> bool:
+    row = db.get(Lease, "worker")
+    return bool(row and row.owner != owner and row.expires_at > utcnow())

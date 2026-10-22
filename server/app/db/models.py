@@ -175,6 +175,12 @@ class PublicationJob(Base):
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # stato remoto granulare (vedi domain/states.REMOTE_*) e verifica esterna: "Buffer dice inviato" ≠ "visibile su TikTok"
+    remote_state: Mapped[str] = mapped_column(String(32), default="LOCAL")
+    verification: Mapped[str] = mapped_column(String(24), default="NONE")  # NONE | EXTERNALLY_VERIFIED
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    send_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)  # intenzione di createPost persistita
+    reconcile_empty_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
     clip: Mapped[Clip] = relationship()

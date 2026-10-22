@@ -123,6 +123,8 @@ def test_helix_download_urls_batches_of_10_and_prefers_portrait():
     seen = []
 
     def handler(req):
+        if req.url.path.endswith("/validate"):
+            return httpx.Response(200, json={"user_id": "1", "login": "idenstv", "scopes": ["channel:manage:clips"]})
         ids = req.url.params.get_list("clip_id")
         seen.append(len(ids))
         return httpx.Response(200, json={"data": [{"clip_id": i, "portrait_download_url": "https://p/" + i, "landscape_download_url": "https://l/" + i} for i in ids]})

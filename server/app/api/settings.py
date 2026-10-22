@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -10,7 +11,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.adapters.twitch.helix import OAUTH, SCOPES
+from app.adapters.twitch.helix import OAUTH, REQUIRED_SCOPE, SCOPES
 from app.adapters.video import ffmpeg
 from app.api.deps import DB
 from app.core.config import get_env
@@ -64,6 +65,14 @@ def put_secret(body: SecretBody, db: Session = DB) -> dict:
     ss.set_secret(db, body.name, body.value.strip())
     if body.name == "twitch_client_id" and body.value.strip():
         ss.update_settings(db, {"system": {"demo_mode": False}})
+    if body.name == "buffer_api_key":
+        # un'altra chiave = un altro account/canale potenziale: scollega e torna in DRY RUN finché non si ritesta e si riseleziona
+        from app.db.models import Setting
+
+        row = db.get(Setting, "product")
+        if row is not None:
+            row.value = {**row.value, "publishing": {**row.value["publishing"], "is_connected": False, "channel_id": "", "organization_id": "",
+                                                       "live_enabled": False, "dry_run": True}}
     events.emit(db, "settings", "secret_updated", f"Segreto '{body.name}' aggiornato")  # il valore non viene mai loggato
     return {"secrets": ss.secrets_status(db)}
 
@@ -106,6 +115,7 @@ def twitch_connect(db: Session = DB) -> dict:
     cid = ss.get_secret(db, "twitch_client_id")
     if not cid or not ss.get_secret(db, "twitch_client_secret"):
         raise ClipyError("Inserisci Client ID e Client Secret Twitch prima di collegare l'account", code="twitch_not_configured", status_code=409)
+    db.query(OAuthState).filter(OAuthState.created_at < utcnow() - timedelta(minutes=15)).delete()  # pulizia stati scaduti
     state = uuid.uuid4().hex
     db.add(OAuthState(state=state))
     db.flush()
@@ -115,25 +125,42 @@ def twitch_connect(db: Session = DB) -> dict:
 
 @router.get("/integrations/twitch/callback")
 def twitch_callback(code: str = "", state: str = "", error: str = "", db: Session = DB):
+    """Authorization Code: `state` monouso e a scadenza (CSRF), scope e identità verificati prima di salvare i token."""
     row = db.get(OAuthState, state) if state else None
-    if error or row is None or (utcnow() - row.created_at).total_seconds() > 600:
+    if row is not None:
+        db.delete(row)  # monouso, anche in caso di errore
+        db.flush()
+    expired = row is not None and (utcnow() - row.created_at).total_seconds() > 600
+    if error or row is None or expired or not code:
+        events.emit(db, "twitch", "oauth_rejected", "Callback OAuth Twitch rifiutato (state non valido/scaduto, o autorizzazione negata)", severity="warning")
         return RedirectResponse("/settings?twitch=error")
-    db.delete(row)
     try:
         with httpx.Client(timeout=20) as c:
             r = c.post(f"{OAUTH}/token", data={"client_id": ss.get_secret(db, "twitch_client_id"), "client_secret": ss.get_secret(db, "twitch_client_secret"),
                                                "code": code, "grant_type": "authorization_code", "redirect_uri": get_env().twitch_redirect_uri})
             if r.status_code != 200:
+                events.emit(db, "twitch", "oauth_failed", f"Scambio del codice OAuth fallito (HTTP {r.status_code})", severity="warning")
                 return RedirectResponse("/settings?twitch=error")
             j = r.json()
-            v = c.get(f"{OAUTH}/validate", headers={"Authorization": f"OAuth {j['access_token']}"}).json()
-    except httpx.HTTPError:
+            vr = c.get(f"{OAUTH}/validate", headers={"Authorization": f"OAuth {j['access_token']}"})
+            v = vr.json() if vr.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError, KeyError):
         return RedirectResponse("/settings?twitch=error")
+    scopes = list(v.get("scopes") or j.get("scope") or [])
+    if REQUIRED_SCOPE not in scopes:
+        events.emit(db, "twitch", "oauth_scope_missing", f"Autorizzazione senza lo scope {REQUIRED_SCOPE}: token NON salvato", severity="warning")
+        return RedirectResponse("/settings?twitch=scope")
     ss.set_secret(db, "twitch_access_token", j["access_token"])
     ss.set_secret(db, "twitch_refresh_token", j.get("refresh_token", ""))
     ss.update_settings(db, {"system": {"demo_mode": False}})
-    events.emit(db, "twitch", "authorized", f"Twitch autorizzato come {v.get('login', '?')} (scope: {', '.join(v.get('scopes', []))})")
-    return RedirectResponse("/settings?twitch=ok")
+    login = str(v.get("login", ""))
+    configured = ss.get_settings(db).twitch.login.lstrip("@").lower()
+    ss.set_twitch_auth(db, {"user_id": str(v.get("user_id", "")), "login": login, "scopes": scopes, "authorized_at": utcnow().isoformat()})
+    same = login.lower() == configured
+    events.emit(db, "twitch", "authorized", f"Twitch autorizzato come {login or '?'} (scope: {', '.join(scopes)})"
+                + ("" if same else f". ATTENZIONE: il canale configurato è {configured}: serve che {login} sia editor di quel canale"),
+                severity="info" if same else "warning")
+    return RedirectResponse("/settings?twitch=ok" if same else "/settings?twitch=not_owner")
 
 
 @router.post("/integrations/twitch/test")
@@ -162,15 +189,18 @@ def buffer_select(body: BufferSelect, db: Session = DB) -> dict:
     if ch is None:
         raise ClipyError("Canale non trovato nell'account Buffer", code="channel_not_found", status_code=404)
     if ch.get("disconnected"):
-        raise ClipyError("Il canale risulta disconnesso su Buffer", code="channel_disconnected", status_code=409)
+        raise ClipyError("Il canale risulta disconnesso su Buffer: ricollegalo dal pannello Buffer", code="channel_disconnected", status_code=409)
     if ch.get("service") and ch["service"].lower() != "tiktok":
         raise ClipyError("Il canale selezionato non è TikTok", code="not_tiktok", status_code=409)
+    if not ch.get("organization_id"):
+        raise ClipyError("Organizzazione Buffer del canale sconosciuta", code="organization_missing", status_code=409)
     from app.db.models import Setting
 
     ss.get_settings(db)
     row = db.get(Setting, "product")
     assert row is not None
-    row.value = {**row.value, "publishing": {**row.value["publishing"], "channel_id": body.channel_id, "is_connected": True}}
+    row.value = {**row.value, "publishing": {**row.value["publishing"], "channel_id": body.channel_id, "is_connected": True,
+                                                 "organization_id": ch.get("organization_id", "")}}
     events.emit(db, "buffer", "channel_selected", f"Canale TikTok selezionato: {ch.get('name')}")
     return get_settings(db)
 

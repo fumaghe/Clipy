@@ -59,6 +59,7 @@ class AnalysisContext:
     avoid_titles: list[str] = field(default_factory=list)
     demo_fixture: str | None = None
     variation: int = 0  # rigenerazione: alternative diverse
+    budget_usd: float = 0.0  # 0 = nessun limite
 
 
 @dataclass

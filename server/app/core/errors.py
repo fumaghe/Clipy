@@ -5,9 +5,12 @@ class ClipyError(Exception):
     status_code = 400
     code = "clipy_error"
 
-    def __init__(self, message: str, *, code: str | None = None, status_code: int | None = None):
+    def __init__(self, message: str, *, code: str | None = None, status_code: int | None = None,
+                 retry_after: float | None = None, ambiguous: bool = False):
         super().__init__(message)
         self.message = message
+        self.retry_after = retry_after  # secondi suggeriti dal provider (429 / Retry-After)
+        self.ambiguous = ambiguous  # True = la richiesta potrebbe essere stata eseguita dal provider (esito incerto)
         if code:
             self.code = code
         if status_code:
@@ -33,3 +36,8 @@ class TemporaryError(ClipyError):
     """Errore ritentabile con backoff (rete, 5xx, rate limit)."""
     code = "temporary_error"
     status_code = 503
+
+
+class IncompleteResult(PermanentError):
+    """Una ricerca remota non ha potuto esaminare tutti i risultati: l'assenza di un post NON è dimostrata."""
+    code = "remote_search_incomplete"

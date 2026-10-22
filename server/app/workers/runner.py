@@ -23,8 +23,16 @@ _sched: BackgroundScheduler | None = None
 _proc_lock = threading.Lock()
 
 
+_was_leader = False
+
+
 def _leader(db) -> bool:
+    """Lease unico nel DB. Alla prima acquisizione di questo processo (dopo un crash/riavvio) recupera i lock orfani."""
+    global _was_leader
     ok = leases.acquire_leader(db, "worker", OWNER, 60)
+    if ok and not _was_leader:
+        leases.recover_locks(db)
+    _was_leader = ok
     db.commit()
     return ok
 

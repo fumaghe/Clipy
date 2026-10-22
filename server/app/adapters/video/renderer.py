@@ -163,6 +163,7 @@ def build_filter(cfg: TemplateConfig, src: dict, textfile: Path | None, layout: 
     parts = [
         f"fontfile='{_esc_path(font_path)}'",
         f"textfile='{_esc_path(textfile)}'",
+        "expansion=none",  # il titolo è testo letterale: '%{...}' e backslash non devono essere interpretati da drawtext
         f"fontsize={layout.font_size}",
         f"fontcolor={_hex(cfg.text_color)}",
         f"borderw={cfg.stroke_width}",
@@ -192,7 +193,7 @@ class FFmpegRenderer:
 
     def _prep(self, source: Path, text: str, cfg: TemplateConfig, workdir: Path):
         if not ffmpeg.have_binary("ffmpeg"):
-            raise PermanentError("ffmpeg non trovato nel PATH", code="ffmpeg_missing")
+            raise PermanentError("ffmpeg non trovato (PATH, cartelle comuni Windows o CLIPY_FFMPEG_DIR)", code="ffmpeg_missing")
         src = ffmpeg.probe(source)
         font_path, fwarn = resolve_font(cfg.font_file)
         layout = layout_text(text, cfg, font_path)
@@ -213,9 +214,11 @@ class FFmpegRenderer:
         tmp_out = out_path.with_suffix(".part.mp4")
         cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(source), "-filter_complex", flt, "-map", "[vout]"]
         if src["has_audio"]:
-            cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", f"{self.ab}k", "-ar", "44100", "-ac", "2"]
+            cmd += ["-map", "0:a:0", "-af", "aresample=async=1:first_pts=0", "-c:a", "aac", "-b:a", f"{self.ab}k", "-ar", "44100", "-ac", "2"]
         else:
             warns.append("no_audio")
+        if src["height"] * src["width"] < cfg.canvas_width * cfg.canvas_height * 0.25:
+            warns.append("low_source_resolution")  # upscaling forte: output comunque 1080×1920
         cmd += ["-r", str(self.fps), "-c:v", "libx264", "-preset", self.preset, "-profile:v", "high", "-pix_fmt", "yuv420p",
                 "-b:v", f"{self.vb}k", "-maxrate", f"{int(self.vb * 1.5)}k", "-bufsize", f"{self.vb * 2}k",
                 "-movflags", "+faststart", "-f", "mp4", str(tmp_out)]
@@ -275,11 +278,32 @@ def verify_output(path: Path, cfg: TemplateConfig, layout: TextLayout, src: dict
         "duration_ok": abs(out["duration"] - src["duration"]) < max(1.0, src["duration"] * 0.1) and out["duration"] >= 1.0,
         "audio_ok": (out["has_audio"] == src["has_audio"]),
         "text_clipped": bool(layout.clipped),
+        "safe_area_ok": safe_area_ok(cfg, layout),
+        "av_sync_ok": _av_sync_ok(out),
         "min_dim_ok": min(out["width"], out["height"]) >= 360,
         "file_ok": out["size_bytes"] > 1000,
     }
     checks["ok"] = all(checks[k] for k in ("aspect_ok", "codec_ok", "duration_ok", "audio_ok", "min_dim_ok", "file_ok"))
     return checks
+
+
+# La UI di TikTok copre ~top 8% e ~bottom 20% (+ colonna azioni a destra): stime prudenti, da confermare sul template di riferimento.
+SAFE_TOP, SAFE_BOTTOM = 0.08, 0.80
+
+
+def safe_area_ok(cfg: TemplateConfig, layout: TextLayout) -> bool:
+    if not layout.lines:
+        return True
+    H, W = cfg.canvas_height, cfg.canvas_width
+    cy = H * cfg.y_percent / 100 + cfg.vertical_offset
+    top, bottom = cy - layout.height_px / 2, cy + layout.height_px / 2
+    margin = W * cfg.safe_margin_percent / 100
+    return top >= H * SAFE_TOP and bottom <= H * SAFE_BOTTOM and layout.width_px <= W - 2 * margin
+
+
+def _av_sync_ok(out: dict) -> bool:
+    a, v = out.get("audio_duration"), out.get("video_duration")
+    return True if not a or not v else abs(a - v) <= 0.5
 
 
 def remove_tree(p: Path) -> None:
