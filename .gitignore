@@ -11,3 +11,5 @@ data/*
 *.db-shm
 .pytest_cache/
 .ruff_cache/
+frontend/test-results/
+frontend/playwright-report/

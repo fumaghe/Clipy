@@ -75,6 +75,20 @@ def publisher_tick() -> None:
         db.close()
 
 
+def retention_tick() -> None:
+    from app.services import retention
+
+    db = new_session()
+    try:
+        if _leader(db):
+            retention.cleanup(db)
+            db.commit()
+    except Exception:
+        log.exception("retention_tick")
+    finally:
+        db.close()
+
+
 def start() -> None:
     global _sched
     if _sched is not None:
@@ -84,6 +98,7 @@ def start() -> None:
     _sched.add_job(collector_tick, "interval", seconds=30, id="collector", next_run_time=utcnow() + timedelta(seconds=3))
     _sched.add_job(pipeline_tick, "interval", seconds=env.pipeline_tick_seconds, id="pipeline")
     _sched.add_job(publisher_tick, "interval", seconds=env.publisher_tick_seconds, id="publisher")
+    _sched.add_job(retention_tick, "interval", hours=6, id="retention", next_run_time=utcnow() + timedelta(minutes=2))
     _sched.start()
     log.info("worker avviato (owner %s)", OWNER)
 
