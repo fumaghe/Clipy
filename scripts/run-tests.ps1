@@ -2,13 +2,14 @@
 param([switch]$E2E)
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-Set-Location "$Root\server"
-Write-Host "== ruff"; & ..\.venv\Scripts\ruff.exe check app
-Write-Host "== pytest"; & ..\.venv\Scripts\pytest.exe app/tests -q
-Set-Location "$Root\frontend"
-Write-Host "== typecheck"; npm run typecheck
-Write-Host "== lint"; npm run lint
-Write-Host "== vitest"; npm test
-Write-Host "== build"; npm run build
-if ($E2E) { Write-Host "== playwright"; npx playwright test }
+function Step($name, [scriptblock]$cmd) { Write-Host "== $name"; & $cmd; if ($LASTEXITCODE -ne 0) { throw "Fallito: $name" } }
+Set-Location -LiteralPath "$Root\server"
+Step "ruff" { & ..\.venv\Scripts\ruff.exe check app }
+Step "pytest" { & ..\.venv\Scripts\pytest.exe app/tests -q }
+Set-Location -LiteralPath "$Root\frontend"
+Step "typecheck" { npm run typecheck }
+Step "lint" { npm run lint }
+Step "vitest" { npm test }
+Step "build" { npm run build }
+if ($E2E) { Step "playwright" { npx playwright test } }
 Write-Host "TUTTO OK"

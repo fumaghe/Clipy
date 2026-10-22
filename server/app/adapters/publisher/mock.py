@@ -30,7 +30,10 @@ class MockPublisher:
             self.path.write_text(json.dumps(d), "utf-8")
 
     def test_connection(self) -> dict:
-        return {"ok": True, "simulated": True, "channels": [{"id": "mock-tiktok", "name": "TikTok (SIMULATO)", "service": "tiktok"}]}
+        return {"ok": True, "simulated": True, "warnings": [], "tiktok_channels": 1,
+                "organizations": [{"id": "mock-org", "name": "Organizzazione (SIMULATA)"}],
+                "channels": [{"id": "mock-tiktok", "name": "TikTok (SIMULATO)", "service": "tiktok", "disconnected": False, "eligible": True,
+                              "reason": None, "organization_id": "mock-org", "organization": "Organizzazione (SIMULATA)"}]}
 
     def create_post(self, req: PublishRequest) -> RemotePost:
         d = self._load()

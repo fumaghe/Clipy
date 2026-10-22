@@ -1,6 +1,6 @@
 import { AlertTriangle, Inbox, Loader2, X } from "lucide-react";
 import { createContext, useCallback, useContext, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
-import { STATUS_LABEL } from "../lib/format";
+import { REMOTE_STATE_LABEL, STATUS_LABEL } from "../lib/format";
 
 export function Button({ variant = "primary", busy, className = "", children, ...rest }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "ghost" | "danger" | "success"; busy?: boolean }) {
   const styles = {
@@ -40,6 +40,12 @@ export function statusTone(s: string): keyof typeof TONE {
 }
 
 export const StatusBadge = ({ status }: { status: string }) => <Badge tone={statusTone(status)}>{STATUS_LABEL[status] ?? status}</Badge>;
+
+export function RemoteStateBadge({ state }: { state?: string }) {
+  if (!state || state === "LOCAL") return null;
+  const m = REMOTE_STATE_LABEL[state];
+  return m ? <Badge tone={m.tone} title={m.help}>{m.label}</Badge> : <Badge>{state}</Badge>;
+}
 
 export const SimBadge = ({ label = "SIMULATO" }: { label?: string }) => <Badge tone="blue" title="Dato/azione simulata in modalità demo">{label}</Badge>;
 

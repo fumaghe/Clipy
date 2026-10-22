@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import { Badge, Button, Card, ErrorState, Field, PageHeader, Spinner } from "../components/ui";
 import { useAction, useStatus } from "../hooks/useApi";
 import { useSettings } from "../hooks/useSettings";
-import { patch, post, put } from "../lib/api";
-import { fmtDateTime } from "../lib/format";
+import { get, patch, post, put } from "../lib/api";
+import { DIAG_STATE, fmtDateTime } from "../lib/format";
+import type { DiagEntry } from "../types";
 
 function SecretInput({ name, label, configured, hint }: { name: string; label: string; configured: boolean; hint?: string }) {
   const [v, setV] = useState("");
@@ -34,7 +36,9 @@ function TwitchCard({ s, secrets }: { s: any; secrets: Record<string, boolean> }
   return (
     <Card title="Twitch" actions={<Badge tone={st?.twitch.authorized ? "green" : "amber"}>{st?.twitch.authorized ? "Autorizzato" : st?.twitch.simulated ? "Simulato" : "Non autorizzato"}</Badge>}>
       {params.get("twitch") === "ok" && <p className="mb-2 text-sm text-emerald-300">Account Twitch collegato.</p>}
-      {params.get("twitch") === "error" && <p className="mb-2 text-sm text-red-300">Collegamento Twitch non riuscito.</p>}
+      {params.get("twitch") === "error" && <p className="mb-2 text-sm text-red-300">Collegamento Twitch non riuscito (autorizzazione negata, sessione scaduta o codice non valido).</p>}
+      {params.get("twitch") === "scope" && <p className="mb-2 text-sm text-red-300">Autorizzazione senza lo scope <code>channel:manage:clips</code>: token NON salvato. Ripeti il collegamento accettando tutti i permessi.</p>}
+      {params.get("twitch") === "not_owner" && <p className="mb-2 text-sm text-amber-300">Hai autorizzato un account diverso dal canale configurato. Funziona solo se quell'account è editor del canale.</p>}
       <div className="space-y-3">
         <div className="grid gap-3 md:grid-cols-3">
           <Field label="Canale (login)"><input className="input" value={login} onChange={(e) => setLogin(e.target.value)} /></Field>
@@ -59,6 +63,8 @@ function TwitchCard({ s, secrets }: { s: any; secrets: Record<string, boolean> }
 
 function BufferWizard({ s, secrets }: { s: any; secrets: Record<string, boolean> }) {
   const [channels, setChannels] = useState<any[] | null>(null);
+  const [orgs, setOrgs] = useState<any[]>([]);
+  const [warn, setWarn] = useState<string[]>([]);
   const [sim, setSim] = useState(false);
   const test = useAction(() => post("/api/v1/integrations/buffer/test"), { ok: "Test riuscito (nessun post creato)", invalidate: [] });
   const select = useAction((id: string) => post("/api/v1/integrations/buffer/select", { channel_id: id }), { ok: "Canale TikTok collegato", invalidate: [["settings"], ["status"]] });
@@ -75,17 +81,19 @@ function BufferWizard({ s, secrets }: { s: any; secrets: Record<string, boolean>
       <div className="space-y-3">
         <SecretInput name="buffer_api_key" label="Buffer API key" configured={secrets.buffer_api_key} />
         <div className="flex flex-wrap gap-2">
-          <Button variant="ghost" busy={test.isPending} onClick={() => test.mutate(undefined, { onSuccess: (r: any) => { setChannels(r.channels); setSim(r.simulated); } })}>Testa e elenca canali</Button>
+          <Button variant="ghost" busy={test.isPending} onClick={() => test.mutate(undefined, { onSuccess: (r: any) => { setChannels(r.channels); setOrgs(r.organizations ?? []); setWarn(r.warnings ?? []); setSim(r.simulated); } })}>Testa e elenca canali</Button>
           <Button variant="ghost" onClick={() => provider.mutate(s.publishing.provider === "mock" ? "buffer" : "mock")}>{s.publishing.provider === "mock" ? "Usa Buffer reale" : "Usa publisher DEMO (simulato)"}</Button>
         </div>
         {sim && <Badge tone="blue">Canali SIMULATI (publisher demo)</Badge>}
+        {channels && <p className="text-xs text-zinc-500">{orgs.length} organizzazione/i · {channels.length} canali{s.publishing.organization_id ? <> · organizzazione selezionata <code>{s.publishing.organization_id}</code></> : null}</p>}
+        {warn.map((w) => <p key={w} className="text-xs text-amber-300">{w}</p>)}
         {channels && (
           <ul className="space-y-1 text-sm">
             {channels.length === 0 && <li className="text-zinc-500">Nessun canale trovato.</li>}
             {channels.map((c) => (
               <li key={c.id} className="flex items-center justify-between rounded-lg border border-zinc-800 p-2">
-                <span>{c.name} <span className="text-xs text-zinc-500">({c.service}{c.disconnected ? ", disconnesso" : ""}) · <code>{c.id}</code></span></span>
-                <Button variant="ghost" busy={select.isPending} onClick={() => select.mutate(c.id)}>{s.publishing.channel_id === c.id ? "Selezionato ✓" : "Usa questo"}</Button>
+                <span>{c.name} <span className="text-xs text-zinc-500">({c.service}{c.disconnected ? ", disconnesso" : ""}{c.organization ? ` · org ${c.organization}` : ""}) · <code>{c.id}</code></span>{c.eligible === false && c.reason && <span className="block text-xs text-amber-300">{c.reason}</span>}</span>
+                <Button variant="ghost" disabled={c.eligible === false} busy={select.isPending} onClick={() => select.mutate(c.id)}>{s.publishing.channel_id === c.id ? "Selezionato ✓" : "Usa questo"}</Button>
               </li>
             ))}
           </ul>
@@ -177,6 +185,46 @@ function ReviewCard({ s }: { s: any }) {
   );
 }
 
+export function DiagnosticsCard() {
+  const q = useQuery({ queryKey: ["diagnostics"], queryFn: () => get<{ items: DiagEntry[] }>("/api/v1/integrations/diagnostics"), refetchInterval: 15000 });
+  const [pending, setPending] = useState<string | null>(null);
+  const run = useAction((a: { id: string; confirm: boolean }) => post(`/api/v1/integrations/diagnostics/${a.id}/test`, { confirm: a.confirm }), {
+    ok: (r: DiagEntry) => `${r.label}: ${DIAG_STATE[r.state].label}`, invalidate: [["diagnostics"], ["status"]],
+  });
+  if (q.isLoading) return <Spinner />;
+  if (q.error) return <ErrorState error={q.error} retry={() => q.refetch()} />;
+  const start = (e: DiagEntry) => (e.test_requires_confirm ? setPending(e.id) : run.mutate({ id: e.id, confirm: false }));
+  return (
+    <Card title="Diagnostica integrazioni" actions={<span className="text-xs text-zinc-500">I test non pubblicano, non toccano la coda né i video.</span>}>
+      <ul className="space-y-2" data-testid="diagnostics">
+        {q.data!.items.map((e) => (
+          <li key={e.id} className="rounded-lg border border-zinc-800 p-3" data-testid={`diag-${e.id}`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <b className="text-sm">{e.label}</b>
+              <Badge tone={DIAG_STATE[e.state].tone}>{DIAG_STATE[e.state].label}</Badge>
+              {e.simulated && <Badge tone="blue" title="Questa integrazione sta usando una simulazione">SIMULATO</Badge>}
+              <span className="ml-auto" />
+              <Button variant="ghost" busy={run.isPending && run.variables?.id === e.id} onClick={() => start(e)}>Testa</Button>
+            </div>
+            <p className="mt-1 text-xs text-zinc-400">{e.summary}</p>
+            {e.last_test && <p className={`mt-1 text-xs ${e.last_test.ok === false ? "text-red-300" : "text-zinc-500"}`}>Ultimo test {fmtDateTime(e.last_test.at)}: {e.last_test.message}</p>}
+            {e.hints.map((h) => <p key={h} className="text-xs text-amber-300">→ {h}</p>)}
+            {pending === e.id && (
+              <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-2 text-xs">
+                <p className="mb-2">{e.confirm_text}</p>
+                <div className="flex gap-2">
+                  <Button variant="danger" onClick={() => { setPending(null); run.mutate({ id: e.id, confirm: true }); }}>Conferma ed esegui</Button>
+                  <Button variant="ghost" onClick={() => setPending(null)}>Annulla</Button>
+                </div>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 function HealthCard() {
   const { data: s } = useStatus();
   if (!s) return null;
@@ -203,6 +251,7 @@ export function SettingsPage() {
     <>
       <PageHeader title="Settings" subtitle="Le chiavi non vengono mai mostrate dopo il salvataggio." />
       <div className="space-y-4">
+        <DiagnosticsCard />
         <HealthCard />
         <TwitchCard s={s} secrets={secrets} />
         <PublishingCard s={s} />

@@ -57,6 +57,8 @@ export interface Job {
   next_attempt_at: string | null;
   error: string | null;
   last_reconciled_at: string | null;
+  remote_state?: string;
+  verification?: string;
   clip_title: string | null;
   overlay_title: string | null;
 }
@@ -128,4 +130,19 @@ export interface EventRow {
   severity: string;
   message: string;
   clip_id: string | null;
+}
+
+export type DiagState = "NOT_CONFIGURED" | "CONFIGURED" | "CONNECTED" | "TEST_FAILED" | "NEEDS_LIVE_VERIFICATION";
+
+export interface DiagEntry {
+  id: string;
+  label: string;
+  state: DiagState;
+  simulated: boolean;
+  summary: string;
+  hints: string[];
+  test_requires_confirm: boolean;
+  confirm_text: string | null;
+  last_test: { at: string; ok: boolean | null; message: string; duration_ms: number | null } | null;
+  details: Record<string, unknown>;
 }

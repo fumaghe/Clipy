@@ -18,6 +18,7 @@ class EnvConfig(BaseSettings):
     data_dir: Path = REPO_ROOT / "data"
     database_url: str | None = None
     run_worker: bool = True
+    allowed_hosts: str = "127.0.0.1,localhost,testserver"  # header Host accettati (anti DNS-rebinding); "testserver" = TestClient
     cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
     templates_dir: Path = REPO_ROOT / "templates"
     frontend_dist: Path = REPO_ROOT / "frontend" / "dist"

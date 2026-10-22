@@ -63,6 +63,16 @@ def reconcile(job_id: str, db: Session = DB) -> dict:
     return pub_dto(publishing.reconcile_now(db, job_id)).model_dump(mode="json")
 
 
+class VerifyBody(BaseModel):
+    note: str = Field("", max_length=200)
+
+
+@router.post("/publications/{job_id}/verify-external")
+def verify_external(job_id: str, body: VerifyBody, db: Session = DB) -> dict:
+    """L'utente conferma di aver visto il post pubblicato su TikTok (Buffer 'sent' non basta)."""
+    return pub_dto(publishing.mark_externally_verified(db, job_id, body.note)).model_dump(mode="json")
+
+
 @router.post("/publications/{job_id}/retry")
 def retry(job_id: str, db: Session = DB) -> dict:
     return pub_dto(publishing.retry_job(db, job_id)).model_dump(mode="json")

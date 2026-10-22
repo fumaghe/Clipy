@@ -22,16 +22,22 @@ class S3Storage:
             client = boto3.client("s3", endpoint_url=endpoint_url or None, region_name=region or "auto",
                                   aws_access_key_id=access_key, aws_secret_access_key=secret_key)
         self.client = client
+        self._secrets = [x for x in (access_key, secret_key) if x]
         self.bucket = bucket
         self.base = public_base_url.rstrip("/")
         self.prefix = key_prefix
+
+    def _scrub(self, text: str) -> str:
+        for s in self._secrets:
+            text = text.replace(s, "***")
+        return text[:300]
 
     def upload(self, path: Path, key: str) -> StoredAsset:
         full = f"{self.prefix}{key}"
         try:
             self.client.upload_file(str(path), self.bucket, full, ExtraArgs={"ContentType": "video/mp4"})
         except Exception as exc:
-            raise TemporaryError(f"Upload storage fallito: {exc}", code="storage_upload_failed") from exc
+            raise TemporaryError(f"Upload storage fallito: {self._scrub(str(exc))}", code="storage_upload_failed") from exc
         return StoredAsset(key=full, url=f"{self.base}/{full}", public=True)
 
     def verify_public(self, url: str) -> tuple[bool, str]:
@@ -42,7 +48,7 @@ class S3Storage:
                 if r.status_code in (403, 405):
                     r = c.get(url, headers={"Range": "bytes=0-1023"})
         except httpx.HTTPError as exc:
-            return False, f"URL non raggiungibile: {exc}"
+            return False, f"URL non raggiungibile: {type(exc).__name__}"
         ctype = r.headers.get("content-type", "")
         if r.status_code not in (200, 206):
             return False, f"HTTP {r.status_code}"
@@ -54,4 +60,4 @@ class S3Storage:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         except Exception as exc:
-            raise TemporaryError(f"Cancellazione asset fallita: {exc}", code="storage_delete_failed") from exc
+            raise TemporaryError(f"Cancellazione asset fallita: {self._scrub(str(exc))}", code="storage_delete_failed") from exc

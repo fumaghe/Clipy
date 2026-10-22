@@ -21,10 +21,29 @@ def _estimate(tin: int, tout: int) -> float:
 
 
 def parse_json_output(text: str) -> AnalysisOutput:
-    m = re.search(r"\{.*\}", text, re.S)
+    """Estrae e valida il JSON. Rifiuta output vuoti/privi dei campi essenziali (non vengono 'riempiti' inventando)."""
+    m = re.search(r"\{.*\}", text or "", re.S)
     if not m:
         raise ValueError("nessun JSON nella risposta")
-    return AnalysisOutput.model_validate(json.loads(m.group(0)))
+    out = AnalysisOutput.model_validate(json.loads(m.group(0)))
+    if not out.overlay_title.strip():
+        raise ValueError("overlay_title mancante")
+    if not out.tiktok_caption.strip():
+        raise ValueError("tiktok_caption mancante")
+    return out
+
+
+def fallback_result(ctx: AnalysisContext, reason: str, provider: str = "fallback", model: str = "", timings: dict | None = None,
+                    tokens_in: int = 0, tokens_out: int = 0) -> AnalysisResult:
+    """Risultato descrittivo costruito SOLO dal titolo Twitch, marcato `analysis_failed` → la clip finisce in NEEDS_REVIEW."""
+    base = ctx.clip_title or "Clip Twitch"
+    out = AnalysisOutput(language=ctx.language, scene_summary=base, overlay_title=base, tiktok_caption=base, hashtags=["#gaming"], confidence=0.1,
+                         requires_review=True, reason=reason, quality_flags=["analysis_failed"])
+    return AnalysisResult(postprocess(out, ctx), provider, model, PROMPT_VERSION, False, tokens_in, tokens_out, _estimate(tokens_in, tokens_out), timings or {})
+
+
+def estimate_input_tokens(system: str, user: str, n_images: int) -> int:
+    return int((len(system) + len(user)) / 3.5) + n_images * 800  # stima prudente (immagini ~800 token ciascuna)
 
 
 def postprocess(out: AnalysisOutput, ctx: AnalysisContext) -> AnalysisOutput:
@@ -67,10 +86,12 @@ class MockAnalyzer:
 
 
 class LLMAnalyzer:
+    MAX_OUTPUT_TOKENS = 800
+
     def __init__(self, provider: str, api_key: str, model: str, base_url: str = "", vision: bool = False,
-                 http: httpx.Client | None = None):
+                 http: httpx.Client | None = None, timeout: int = 60):
         self.provider, self.key, self.model, self.base_url, self.vision = provider, api_key, model, base_url.rstrip("/"), vision
-        self.http = http or httpx.Client(timeout=httpx.Timeout(90, connect=15))
+        self.http = http or httpx.Client(timeout=httpx.Timeout(timeout, connect=15))
         if not api_key:
             raise PermanentError("Chiave LLM mancante: impostala in AI Studio / Settings", code="llm_key_missing")
         if not model:
@@ -83,10 +104,10 @@ class LLMAnalyzer:
                 content.append({"type": "text", "text": user})
                 r = self.http.post(self.base_url or "https://api.anthropic.com/v1/messages", headers={
                     "x-api-key": self.key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                    json={"model": self.model, "max_tokens": 800, "system": system, "messages": [{"role": "user", "content": content}]})
+                    json={"model": self.model, "max_tokens": self.MAX_OUTPUT_TOKENS, "system": system, "messages": [{"role": "user", "content": content}]})
                 self._raise(r)
-                j = r.json()
-                return "".join(b.get("text", "") for b in j["content"]), j["usage"]["input_tokens"], j["usage"]["output_tokens"]
+                j = self._body(r)
+                return "".join(b.get("text", "") for b in j["content"] if isinstance(b, dict)), j["usage"]["input_tokens"], j["usage"]["output_tokens"]
             content2: list[dict] = [{"type": "text", "text": user}] + [
                 {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(i).decode()}} for i in images]
             url = (self.base_url or "https://api.openai.com/v1") + "/chat/completions"
@@ -94,38 +115,64 @@ class LLMAnalyzer:
                 "model": self.model, "response_format": {"type": "json_object"},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": content2}]})
             self._raise(r)
-            j = r.json()
+            j = self._body(r)
             u = j.get("usage", {})
             return j["choices"][0]["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
         except httpx.HTTPError as exc:
             raise TemporaryError(f"LLM non raggiungibile: {exc}", code="llm_unreachable") from exc
 
     @staticmethod
-    def _raise(r: httpx.Response) -> None:
+    def _body(r: httpx.Response) -> dict:
+        try:
+            j = r.json()
+        except ValueError as exc:
+            raise ValueError("risposta del provider non è JSON") from exc
+        if not isinstance(j, dict):
+            raise ValueError("risposta del provider inattesa")
+        return j
+
+    def _scrub(self, text: str) -> str:
+        return text.replace(self.key, "***")[:200]
+
+    def _raise(self, r: httpx.Response) -> None:
         if r.status_code in (401, 403):
-            raise PermanentError("Chiave LLM rifiutata", code="llm_auth")
-        if r.status_code == 429 or r.status_code >= 500:
+            raise PermanentError("Chiave LLM rifiutata o senza permessi", code="llm_auth")
+        if r.status_code == 429:
+            ra = r.headers.get("retry-after", "")
+            raise TemporaryError("LLM: rate limit", code="llm_rate_limited", retry_after=float(ra) if ra.replace(".", "", 1).isdigit() else None)
+        if r.status_code >= 500:
             raise TemporaryError(f"LLM {r.status_code}", code="llm_temporary")
         if r.status_code >= 400:
-            raise PermanentError(f"LLM {r.status_code}: {r.text[:200]}", code="llm_error")
+            raise PermanentError(f"LLM {r.status_code}: {self._scrub(r.text)}", code="llm_error")
 
     def analyze(self, ctx: AnalysisContext) -> AnalysisResult:
         t0 = time.time()
         system, user = build_system(ctx), build_user(ctx)
         images = [p.read_bytes() for p in ctx.frames] if self.vision else []
+        dropped = False
+        if ctx.budget_usd > 0:
+            # limite di costo: stima PRIMA della chiamata (2 tentativi max). Prima si rinuncia alle immagini, poi si rifiuta.
+            def est(n_img: int) -> float:
+                return 2 * _estimate(estimate_input_tokens(system, user, n_img), self.MAX_OUTPUT_TOKENS)
+
+            if est(len(images)) > ctx.budget_usd and images:
+                images, dropped = [], True
+            if est(len(images)) > ctx.budget_usd:
+                raise PermanentError(f"Costo stimato ${est(len(images)):.3f} oltre il budget ${ctx.budget_usd:.3f} per clip: analisi non eseguita", code="llm_budget")
         tin = tout = 0
         out: AnalysisOutput | None = None
         err = ""
         for attempt in range(2):
-            text, a, b = self._call(system, user if attempt == 0 else user + f"\nRisposta precedente non valida ({err}). Restituisci SOLO JSON valido.", images)
-            tin, tout = tin + a, tout + b
             try:
+                text, a, b = self._call(system, user if attempt == 0 else user + f"\nRisposta precedente non valida ({err}). Restituisci SOLO JSON valido.", images)
+                tin, tout = tin + a, tout + b
                 out = parse_json_output(text)
                 break
-            except Exception as exc:
-                err = str(exc)[:120]
-        if out is None:  # fallback descrittivo → review
-            out = AnalysisOutput(language=ctx.language, scene_summary=ctx.clip_title, overlay_title=ctx.clip_title, tiktok_caption=ctx.clip_title,
-                                 hashtags=["#gaming"], confidence=0.1, requires_review=True, reason="Output LLM non valido: fallback descrittivo")
+            except (ValueError, KeyError, TypeError, IndexError) as exc:  # JSON malformato, campi mancanti, struttura inattesa
+                err = self._scrub(str(exc))[:120]
+        if out is None:  # output non valido dopo il retry → descrittivo + revisione umana (mai testo inventato)
+            return fallback_result(ctx, f"Output LLM non valido ({err})", self.provider, self.model, {"total_s": round(time.time() - t0, 2)}, tin, tout)
         out = postprocess(out, ctx)
+        if dropped:
+            out.quality_flags = [*out.quality_flags, "vision_skipped_budget"]
         return AnalysisResult(out, self.provider, self.model, PROMPT_VERSION, False, tin, tout, _estimate(tin, tout), {"total_s": round(time.time() - t0, 2)})

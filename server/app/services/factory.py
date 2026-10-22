@@ -42,7 +42,7 @@ def transcriber(db: Session, settings: ProductSettings, demo_clip: bool):
         return OVERRIDES["transcriber"]
     if demo_clip:
         return MockTranscriber()
-    return FasterWhisperTranscriber(settings.ai.whisper_model, settings.ai.whisper_device)
+    return FasterWhisperTranscriber(settings.ai.whisper_model, settings.ai.whisper_device, settings.ai.asr_timeout_seconds)
 
 
 def analyzer(db: Session, settings: ProductSettings, demo_clip: bool):
@@ -51,7 +51,7 @@ def analyzer(db: Session, settings: ProductSettings, demo_clip: bool):
     a = settings.ai
     if demo_clip or a.provider == "mock":
         return MockAnalyzer()
-    return LLMAnalyzer(a.provider, ss.get_secret(db, "llm_api_key"), a.model, a.base_url, a.vision_enabled)
+    return LLMAnalyzer(a.provider, ss.get_secret(db, "llm_api_key"), a.model, a.base_url, a.vision_enabled, timeout=a.llm_timeout_seconds)
 
 
 def storage(db: Session, settings: ProductSettings, *, for_live: bool):
@@ -72,4 +72,4 @@ def publisher(db: Session, settings: ProductSettings):
         return OVERRIDES["publisher"]
     if settings.publishing.provider == "mock":
         return MockPublisher()
-    return BufferPublisher(ss.get_secret(db, "buffer_api_key"))
+    return BufferPublisher(ss.get_secret(db, "buffer_api_key"), organization_id=settings.publishing.organization_id)

@@ -2,24 +2,66 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
-from app.core.errors import PermanentError
+from app.core.errors import PermanentError, TemporaryError
+
+
+def _windows_candidates(name: str) -> list[Path]:
+    exe = f"{name}.exe"
+    roots = [os.environ.get("LOCALAPPDATA", ""), os.environ.get("ProgramFiles", ""), os.environ.get("ProgramData", ""), "C:\\"]
+    out = [Path(os.environ["LOCALAPPDATA"]) / "Microsoft" / "WinGet" / "Links" / exe] if os.environ.get("LOCALAPPDATA") else []
+    for r in roots:
+        if r:
+            out += [Path(r) / "ffmpeg" / "bin" / exe, Path(r) / "Programs" / "ffmpeg" / "bin" / exe]
+    choco = os.environ.get("ChocolateyInstall")
+    if choco:
+        out.append(Path(choco) / "bin" / exe)
+    return out
 
 
 def have_binary(name: str) -> str | None:
-    return shutil.which(name)
+    """Percorso del binario: variabile CLIPY_<NAME> / CLIPY_FFMPEG_DIR, poi PATH, poi cartelle Windows comuni (winget, choco, C:\\ffmpeg)."""
+    explicit = os.environ.get(f"CLIPY_{name.upper()}")
+    if explicit and Path(explicit).is_file():
+        return explicit
+    d = os.environ.get("CLIPY_FFMPEG_DIR")
+    if d:
+        for cand in (Path(d) / name, Path(d) / f"{name}.exe"):
+            if cand.is_file():
+                return str(cand)
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform == "win32":
+        for cand in _windows_candidates(name):
+            if cand.is_file():
+                return str(cand)
+    return None
 
 
 def run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    """Esegue ffmpeg/ffprobe (risolti con have_binary). UTF-8 esplicito (Windows usa cp1252), niente finestra console, timeout → errore ritentabile."""
+    if cmd and cmd[0] in ("ffmpeg", "ffprobe"):
+        cmd = [have_binary(cmd[0]) or cmd[0], *cmd[1:]]
+    kw: dict = {}
+    if sys.platform == "win32":
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL, **kw)
+    except subprocess.TimeoutExpired as exc:
+        raise TemporaryError(f"{Path(cmd[0]).stem} oltre il timeout di {timeout}s (processo terminato)", code="ffmpeg_timeout") from exc
+    except FileNotFoundError as exc:
+        raise PermanentError(f"{Path(cmd[0]).stem} non trovato: installalo o imposta CLIPY_FFMPEG_DIR", code="ffmpeg_missing") from exc
 
 
 def probe(path: Path) -> dict:
     if not have_binary("ffprobe"):
-        raise PermanentError("ffprobe non trovato nel PATH", code="ffprobe_missing")
+        raise PermanentError("ffprobe non trovato (PATH, cartelle comuni Windows o CLIPY_FFMPEG_DIR)", code="ffprobe_missing")
     r = run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)], 60)
     if r.returncode != 0:
         raise PermanentError(f"ffprobe fallito: {r.stderr.strip()[:300]}", code="ffprobe_failed")
@@ -43,6 +85,8 @@ def probe(path: Path) -> dict:
         "vcodec": v.get("codec_name"),
         "pix_fmt": v.get("pix_fmt"),
         "has_audio": a is not None,
+        "audio_duration": float(a.get("duration") or 0) if a else None,
+        "video_duration": float(v.get("duration") or 0) or None,
         "acodec": a.get("codec_name") if a else None,
         "audio_bitrate": int(a.get("bit_rate", 0)) if a and a.get("bit_rate") else None,
         "bit_rate": int(data.get("format", {}).get("bit_rate") or 0),
@@ -56,6 +100,7 @@ def is_portrait(info: dict) -> bool:
 
 
 def extract_audio_wav(video: Path, out: Path) -> bool:
+    """True se è stato estratto audio utilizzabile. Solleva TemporaryError solo per timeout (gestito dal chiamante)."""
     r = run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", str(out)], 300)
     return r.returncode == 0 and out.exists() and out.stat().st_size > 1000
 

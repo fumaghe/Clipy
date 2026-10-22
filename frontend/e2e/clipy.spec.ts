@@ -110,4 +110,26 @@ test.describe.serial("Clipy end-to-end (demo)", () => {
     await page.getByRole("button", { name: "Genera alternative" }).click();
     await expect(page.getByText(/Costo stimato/)).toBeVisible();
   });
+
+  test("Settings: diagnostica distingue simulazioni, test reale FFmpeg e conferma per i test che scrivono", async ({ page, request }) => {
+    await page.goto("/settings");
+    const diag = page.getByTestId("diagnostics");
+    await expect(diag).toBeVisible();
+    await expect(page.getByTestId("diag-twitch").getByText("SIMULATO")).toBeVisible();
+    await expect(page.getByTestId("diag-twitch").getByText("Non configurato")).toBeVisible();
+    await page.getByTestId("diag-ffmpeg").getByRole("button", { name: "Testa" }).click();
+    await expect(page.getByTestId("diag-ffmpeg").getByText("Connesso")).toBeVisible({ timeout: 30_000 });
+    // lo storage richiede conferma esplicita: senza, nessun upload
+    const res = await request.post(api("/integrations/diagnostics/storage/test"), { data: {} });
+    expect(res.status()).toBe(422);
+    // il test non ha alterato la modalità di pubblicazione
+    expect((await (await request.get(api("/system/status"))).json()).live_enabled).toBe(false);
+  });
+
+  test("Sicurezza: origine estranea e host anomalo rifiutati, nessun segreto nelle risposte", async ({ request }) => {
+    const bad = await request.post(api("/settings/live/disable"), { headers: { Origin: "https://evil.example" } });
+    expect(bad.status()).toBe(403);
+    const txt = await (await request.get(api("/settings"))).text();
+    expect(txt).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
+  });
 });

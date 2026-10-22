@@ -11,7 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adapters.publisher.base import PublishRequest
-from app.core.errors import ClipyError, TemporaryError
+from app.adapters.publisher.buffer import same_text
+from app.core.errors import ClipyError, IncompleteResult, TemporaryError
 from app.core.settings_model import ProductSettings
 from app.core.timeutil import utcnow
 from app.db.models import PublicationJob
@@ -43,7 +44,7 @@ def _fail(db: Session, job: PublicationJob, exc: ClipyError, st: ProductSettings
     job.error = exc.message
     job.attempts += 1
     if isinstance(exc, TemporaryError) and job.attempts < st.publishing.max_attempts:
-        job.next_attempt_at = utcnow() + backoff(job.attempts)
+        job.next_attempt_at = utcnow() + max(backoff(job.attempts), timedelta(seconds=exc.retry_after or 0))
         events.transition(db, "publication", job, S.RETRY_PENDING, exc.message)
     elif exc.code == "buffer_mutation_error":
         events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, exc.message)  # es. richiede passaggio TikTok manuale
@@ -72,13 +73,31 @@ def process_job(db: Session, job_id: str) -> None:
         leases.unlock_row(db, PublicationJob, job_id)
 
 
+def job_text(job: PublicationJob, st: ProductSettings) -> str:
+    """Testo ESATTO inviato a Buffer: usato sia dalla create sia dalla riconciliazione (stessa funzione)."""
+    clip = job.clip
+    return captions.compose_post_text(job.caption or clip.caption or "", job.hashtags or clip.hashtags or [], st.publishing.max_caption_length)
+
+
+AMBIGUOUS_CODES = ("buffer_timeout", "buffer_unreachable_after_send", "buffer_network", "buffer_5xx", "buffer_bad_response")
+MIN_EMPTY_RECONCILES = 2  # ricerche complete e vuote richieste prima di ritentare una create dall'esito incerto
+RECONCILE_GRACE = timedelta(minutes=5)
+
+
+def _is_ambiguous(exc: ClipyError) -> bool:
+    return bool(getattr(exc, "ambiguous", False)) or (isinstance(exc, TemporaryError) and exc.code in AMBIGUOUS_CODES and exc.code != "buffer_unreachable")
+
+
 def _process(db: Session, job: PublicationJob) -> None:
     st = ss.get_settings(db)
+    # il job potrebbe essere stato elaborato da un altro worker dopo la selezione: rilegge lo stato sotto lock
+    if job.status not in (S.QUEUED_LOCAL, S.RETRY_PENDING) or job.paused:
+        return
     clip = job.clip
     if clip.status not in S.CLIP_ELIGIBLE or not clip.render_path or not Path(clip.render_path).exists():
         events.transition(db, "publication", job, S.CANCELLED, "clip non più idonea o render mancante")
         return
-    text = captions.compose_post_text(job.caption or clip.caption or "", job.hashtags or clip.hashtags or [], st.publishing.max_caption_length)
+    text = job_text(job, st)
     mode = effective_mode(st)
     job.fingerprint = _fingerprint(job, text)
     if mode == "dry_run":
@@ -87,6 +106,11 @@ def _process(db: Session, job: PublicationJob) -> None:
         job.remote_status = "dry_run"
         events.transition(db, "publication", job, S.DRY_RUN_OK, "DRY RUN: nessuna richiesta esterna")
         events.emit(db, "publisher", "dry_run", f"[DRY RUN] Simulata pubblicazione di {clip.source_clip_id} per {job.due_at.isoformat()}Z", job_id=job.id, clip_id=clip.id)
+        return
+    if mode == "live" and job.due_at <= utcnow() + timedelta(seconds=60) and not job.remote_post_id:
+        # lo slot è scaduto (retry tardivo/riavvio): una createPost con dueAt nel passato potrebbe pubblicare subito
+        events.transition(db, "publication", job, S.QUEUED_LOCAL, "slot scaduto prima dell'invio: verrà riassegnato")
+        job.next_attempt_at = None
         return
     try:
         publisher = factory.publisher(db, st)
@@ -106,52 +130,76 @@ def _process(db: Session, job: PublicationJob) -> None:
         # persistiamo l'intenzione PRIMA della create: dopo un crash si riconcilia, non si rilancia alla cieca
         events.transition(db, "publication", job, S.SCHEDULING)
         job.next_attempt_at = None
+        job.send_started_at, job.remote_state, job.reconcile_empty_count = utcnow(), S.REMOTE_SENDING, 0
         db.commit()
         if mode == "live":
             remote_count = publisher.count_scheduled(job.target_channel_id)
             if remote_count >= st.publishing.remote_max_scheduled:
+                job.remote_state, job.send_started_at = S.REMOTE_LOCAL, None
                 events.transition(db, "publication", job, S.QUEUED_LOCAL, "coda remota piena: resta in coda locale")
                 return
         remote = publisher.create_post(PublishRequest(job.target_channel_id, text, job.asset_url or "", job.due_at, job.fingerprint))
         job.remote_post_id, job.remote_status, job.remote_url = remote.id, remote.status, remote.url
+        job.remote_state = remote_state_for(remote.status)
         job.simulated = bool(getattr(publisher, "simulated", False))
         job.error = None
         events.transition(db, "publication", job, S.SCHEDULED_REMOTE, "pianificato (NON ancora pubblicato)")
         events.emit(db, "publisher", "scheduled", f"Pianificato su {publisher.name} ({remote.id}){' [SIMULATO]' if job.simulated else ''}", job_id=job.id, clip_id=clip.id)
-    except TemporaryError as exc:
-        if job.status == S.SCHEDULING and exc.code in ("buffer_timeout", "buffer_unreachable"):
-            # esito sconosciuto: NON ritentare la create alla cieca → recovery con ricerca remota
+    except ClipyError as exc:
+        if job.status == S.SCHEDULING and _is_ambiguous(exc):
+            # esito sconosciuto: NON ritentare la create alla cieca → riconciliazione con ricerca remota completa
             job.error = exc.message
-            job.next_attempt_at = utcnow() + timedelta(seconds=120)
+            job.next_attempt_at = utcnow() + timedelta(seconds=max(120, exc.retry_after or 0))
             events.emit(db, "publisher", "create_ambiguous", "Esito della create sconosciuto: verrà riconciliato prima di ogni retry", severity="warning", job_id=job.id)
         else:
+            if job.status == S.SCHEDULING and not job.remote_post_id:
+                job.remote_state, job.send_started_at = S.REMOTE_LOCAL, None  # rifiutata prima dell'esecuzione: nulla di remoto
             _fail(db, job, exc, st)
-    except ClipyError as exc:
-        _fail(db, job, exc, st)
+
+
+def remote_state_for(status: str) -> str:
+    return {"scheduled": S.REMOTE_SCHEDULED, "sending": S.REMOTE_SENDING, "sent": S.REMOTE_BUFFER_SENT, "error": S.REMOTE_BUFFER_ERROR}.get(status, S.REMOTE_UNCERTAIN)
 
 
 def recover_scheduling(db: Session, job: PublicationJob) -> None:
-    """Job rimasto in SCHEDULING senza ID remoto (crash/timeout): cerca il post remoto prima di ritentare."""
+    """Job rimasto in SCHEDULING senza ID remoto (crash/timeout): cerca il post remoto prima di ritentare.
+
+    Un secondo createPost è ammesso solo dopo >= MIN_EMPTY_RECONCILES ricerche COMPLETE e vuote a distanza di tempo;
+    se la ricerca è incompleta o i riscontri sono ambigui si passa a NEEDS_REVIEW (mai un post duplicato)."""
     st = ss.get_settings(db)
+    now = utcnow()
     try:
         publisher = factory.publisher(db, st)
         found = publisher.find_posts(job.target_channel_id, job.due_at)
+    except IncompleteResult as exc:
+        job.error = exc.message
+        events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "ricerca remota incompleta: non posso escludere un post già creato")
+        job.remote_state = S.REMOTE_UNCERTAIN
+        return
     except ClipyError as exc:
         job.error = exc.message
-        job.next_attempt_at = utcnow() + backoff(job.attempts + 1)
+        job.next_attempt_at = now + max(backoff(job.attempts + 1), timedelta(seconds=exc.retry_after or 0))
         return
-    text = captions.compose_post_text(job.caption, job.hashtags, st.publishing.max_caption_length)
-    matching = [p for p in found if p.text.strip() == text.strip()] or found
-    if len(matching) == 1:
-        p = matching[0]
-        job.remote_post_id, job.remote_status = p.id, p.status
+    text = job_text(job, st)
+    same = [p for p in found if same_text(p.text, text)]
+    if len(same) == 1:
+        p = same[0]
+        job.remote_post_id, job.remote_status, job.remote_state, job.remote_url = p.id, p.status, remote_state_for(p.status), p.url
+        job.error = None
         events.transition(db, "publication", job, S.SCHEDULED_REMOTE, "post remoto individuato in riconciliazione (nessun duplicato)")
-    elif len(matching) == 0:
-        job.next_attempt_at = utcnow()
-        events.transition(db, "publication", job, S.RETRY_PENDING, "nessun post remoto trovato: ritento in sicurezza")
+    elif len(same) > 1 or found:
+        # più riscontri, oppure post allo stesso orario con testo diverso: non si può stabilire con certezza
+        job.error = "Ambiguità: post remoti compatibili ma non identificabili con certezza" if found else job.error
+        job.remote_state = S.REMOTE_UNCERTAIN
+        events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "riscontri remoti ambigui: verifica manuale per evitare duplicati")
     else:
-        events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "più post remoti compatibili: verifica manuale per evitare duplicati")
-        job.error = "Ambiguità: più post remoti compatibili"
+        job.reconcile_empty_count += 1
+        started = job.send_started_at or job.created_at
+        if job.reconcile_empty_count >= MIN_EMPTY_RECONCILES and now - started >= RECONCILE_GRACE:
+            job.next_attempt_at, job.remote_state = now, S.REMOTE_LOCAL
+            events.transition(db, "publication", job, S.RETRY_PENDING, "nessun post remoto in ricerche complete ripetute: ritento in sicurezza")
+        else:
+            job.next_attempt_at = now + timedelta(seconds=60)  # resta SCHEDULING: nessuna nuova create
 
 
 def reconcile_job(db: Session, job: PublicationJob) -> None:
@@ -172,15 +220,22 @@ def reconcile_job(db: Session, job: PublicationJob) -> None:
         events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "post remoto non trovato (cancellato?)")
         return
     job.remote_status, job.remote_url = p.status, p.url or job.remote_url
+    if job.verification != S.VERIFY_EXTERNAL:
+        job.remote_state = remote_state_for(p.status)
     if p.status == "sent":
-        events.transition(db, "publication", job, S.PUBLISHED, "confermato dallo stato remoto")
+        events.transition(db, "publication", job, S.PUBLISHED, "Buffer segnala inviato (non verificato su TikTok)")
         job.error = None
-        events.emit(db, "publisher", "published", f"Pubblicato (confermato dallo stato remoto){' [SIMULATO]' if job.simulated else ''}", job_id=job.id, clip_id=job.clip_id)
+        events.emit(db, "publisher", "published", f"Buffer segnala il post come inviato (visibilità su TikTok NON verificata){' [SIMULATO]' if job.simulated else ''}", job_id=job.id, clip_id=job.clip_id)
     elif p.status == "error":
         job.error = p.error or "Errore remoto"
         events.transition(db, "publication", job, S.PUB_FAILED, job.error)
     elif p.status == "draft":
         events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "Buffer richiede un passaggio manuale (notification publishing)")
+    elif p.status == "unknown":
+        if job.due_at + timedelta(hours=6) < utcnow():
+            events.transition(db, "publication", job, S.PUB_NEEDS_REVIEW, "stato esterno incerto da oltre 6 ore: verifica su Buffer/TikTok")
+    elif p.status == "scheduled" and job.due_at + timedelta(hours=2) < utcnow():
+        job.remote_state = S.REMOTE_UNCERTAIN  # ancora 'scheduled' ben oltre lo slot: segnalato in UI, nessuna azione automatica
 
 
 def cleanup_assets(db: Session, st: ProductSettings) -> None:
@@ -198,6 +253,10 @@ def tick(db: Session, now=None) -> dict:
     now = now or utcnow()
     st = ss.get_settings(db)
     queue.rebuild(db, now)
+    db.commit()
+    for j in db.scalars(select(PublicationJob).where(PublicationJob.status == S.UPLOADING_ASSET, (PublicationJob.locked_until.is_(None)) | (PublicationJob.locked_until < now))):
+        # crash durante l'upload: nulla è stato inviato a Buffer, si ricomincia (il file orfano viene ripulito dalla retention)
+        events.transition(db, "publication", j, S.QUEUED_LOCAL, "upload interrotto: ripreso")
     db.commit()
     horizon = now + timedelta(hours=st.publishing.lookahead_hours)
     due = list(db.scalars(select(PublicationJob).where(
@@ -239,3 +298,13 @@ def reconcile_now(db: Session, job_id: str) -> PublicationJob:
     return j
 
 
+
+
+def mark_externally_verified(db: Session, job_id: str, note: str = "") -> PublicationJob:
+    """Conferma manuale dell'utente: il post è visibile su TikTok. Unico modo di ottenere EXTERNALLY_VERIFIED."""
+    j = queue.get_job(db, job_id)
+    if j.status != S.PUBLISHED or j.simulated:
+        raise ClipyError("Verificabile solo un job per cui Buffer segnala 'inviato' (non simulato)", code="bad_state", status_code=409)
+    j.verification, j.remote_state, j.verified_at = S.VERIFY_EXTERNAL, S.REMOTE_VERIFIED, utcnow()
+    events.emit(db, "publisher", "externally_verified", f"Pubblicazione verificata dall'utente su TikTok. {note}"[:300], job_id=j.id, clip_id=j.clip_id)
+    return j

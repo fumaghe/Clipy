@@ -43,6 +43,8 @@ class GateInput:
     max_emoji: int = 1
     recent_titles: list[str] = field(default_factory=list)
     simulated_scenario: str = ""  # solo demo: SAFE/AMBIGUOUS/BLOCKED
+    asr_disabled: bool = False  # l'utente ha spento la trascrizione (≠ guasta)
+    sensitive_terms: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -55,6 +57,28 @@ class GateResult:
     @property
     def needs_review(self) -> bool:
         return self.state == "NEEDS_REVIEW"
+
+
+HALLUCINATION_PHRASES = ("sottotitoli a cura", "sottotitoli creati dalla comunità", "amara.org", "thanks for watching", "grazie per la visione",
+                         "iscriviti al canale", "subtitles by", "www.zeoranger")
+_URL_RE = re.compile(r"https?://|www\.", re.I)
+_ARTIFACT_RE = re.compile(r"```|^\s*\{|\}\s*$|<\/?[a-z]+>|\bTODO\b|lorem ipsum|\[\.\.\.\]|\{\{|\bnull\b|\bundefined\b", re.I)
+
+
+def transcript_unusable(text: str) -> str | None:
+    """Motivo per cui una trascrizione NON NULLA non è affidabile (allucinazioni tipiche di Whisper su silenzio/musica)."""
+    t = text.strip()
+    if not t:
+        return None
+    low = t.lower()
+    if any(p in low for p in HALLUCINATION_PHRASES):
+        return "contiene frasi tipiche di allucinazione di Whisper (sottotitoli/outro)"
+    words = re.findall(r"\w+", low)
+    if len(words) >= 6 and len(set(words)) / len(words) < 0.3:
+        return "testo quasi interamente ripetuto"
+    if len(t) >= 3 and sum(ch.isalpha() for ch in t) / len(t) < 0.5:
+        return "poche lettere (rumore/simboli)"
+    return None
 
 
 def _tokens(text: str) -> set[str]:
@@ -78,6 +102,10 @@ def evaluate(inp: GateInput, cfg: ReviewSettings) -> GateResult:
         flag("render_invalid", "Il render finale non ha superato i controlli ffprobe/safe-area.")
     if checks and not checks.get("has_audio", True) and inp.transcript.strip():
         flag("audio_missing", "Manca la traccia audio nonostante una trascrizione.")
+    if checks.get("safe_area_ok") is False:
+        flag("overlay_outside_safe_area", "L'overlay esce dalla safe area di TikTok (interfaccia in alto/in basso).")
+    if checks.get("av_sync_ok") is False:
+        flag("av_desync", "Audio e video hanno durate molto diverse nell'output.")
     if checks.get("text_clipped"):
         flag("overlay_clipped", "L'overlay non rientra nella safe area (testo tagliato).")
     if "crop_unvalidated" in inp.render_warnings or "crop_subject_risk" in inp.render_warnings:
@@ -93,8 +121,11 @@ def evaluate(inp: GateInput, cfg: ReviewSettings) -> GateResult:
     )
     if cfg.require_evidence and not evidence:
         flag("insufficient_evidence", "Nessuna evidenza sufficiente (trascrizione o frame) per sostenere il titolo.")
-    if not inp.asr_available and cfg.review_if_asr_unavailable:
-        flag("asr_unavailable", "Trascrizione locale non disponibile per questa clip.")
+    if not inp.asr_available and not inp.asr_disabled and cfg.review_if_asr_unavailable:
+        flag("asr_unavailable", "Trascrizione locale non disponibile o fallita per questa clip: nessuna trascrizione è stata inventata.")
+    why = transcript_unusable(inp.transcript)
+    if why:
+        flag("transcript_unusable", f"Trascrizione inutilizzabile: {why}.")
 
     # 3. segnali dell'analisi
     if inp.confidence < min_conf:
@@ -104,6 +135,12 @@ def evaluate(inp: GateInput, cfg: ReviewSettings) -> GateResult:
     for qf in inp.quality_flags:
         if qf in ("sensitive_content", "privacy", "rights_uncertain", "hate_or_harassment"):
             flag(qf, f"Segnale dell'analisi: {qf}.")
+    if "analysis_failed" in inp.quality_flags:
+        flag("analysis_failed", "Analisi AI non riuscita: " + (inp.llm_reason or "motivo sconosciuto") + ". Titolo/caption sono solo il titolo Twitch.")
+    low_all = (inp.transcript + " " + inp.clip_title + " " + inp.overlay_title + " " + inp.caption).lower()
+    hits = [t for t in inp.sensitive_terms if t and t.lower() in low_all]
+    if hits and "sensitive_content" not in flags:
+        flag("sensitive_terms", "Possibile contenuto sensibile (termini: " + ", ".join(sorted(set(hits))) + ").")
 
     # 4. testo
     ov, cap = inp.overlay_title.strip(), inp.caption.strip()
@@ -115,6 +152,10 @@ def evaluate(inp: GateInput, cfg: ReviewSettings) -> GateResult:
         flag("caption_too_long", "Caption oltre il limite configurato.")
     if not cap:
         flag("caption_empty", "Caption vuota.")
+    elif _ARTIFACT_RE.search(cap) or _ARTIFACT_RE.search(ov):
+        flag("caption_malformed", "Titolo/caption con artefatti (JSON, markdown, placeholder).")
+    elif _URL_RE.search(cap + " " + ov):
+        flag("caption_has_url", "Titolo/caption contengono un URL non verificato.")
     if len(inp.hashtags) > 5:
         flag("too_many_hashtags", "Più di 5 hashtag.")
     if captions.count_emoji(ov + cap) > max(inp.max_emoji, 0) + 3:

@@ -84,6 +84,9 @@ class PublicationDTO(_Base):
     next_attempt_at: datetime | None
     error: str | None
     last_reconciled_at: datetime | None
+    remote_state: str = "LOCAL"
+    verification: str = "NONE"
+    verified_at: datetime | None = None
     created_at: datetime
     clip_title: str | None = None
     overlay_title: str | None = None

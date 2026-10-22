@@ -34,3 +34,53 @@ DRY_RUN_OK = "DRY_RUN_OK"  # simulato: nessuna richiesta esterna, NON è una pub
 PUB_OPEN = (QUEUED_LOCAL, UPLOADING_ASSET, SCHEDULING, SCHEDULED_REMOTE, RETRY_PENDING, DRY_RUN_OK)
 PUB_OCCUPY_SLOT = (QUEUED_LOCAL, UPLOADING_ASSET, SCHEDULING, SCHEDULED_REMOTE, RETRY_PENDING, PUBLISHED, DRY_RUN_OK)
 PUB_REMOTE = (SCHEDULING, SCHEDULED_REMOTE)
+
+# Stato remoto granulare di un job (indipendente dallo stato locale `status`)
+REMOTE_LOCAL = "LOCAL"                          # nulla è stato inviato
+REMOTE_SENDING = "SENDING"                      # createPost in corso / esito da riconciliare, oppure Buffer 'sending'
+REMOTE_SCHEDULED = "SCHEDULED_ON_BUFFER"        # programmato su Buffer (non ancora pubblicato)
+REMOTE_BUFFER_SENT = "BUFFER_REPORTS_SENT"      # Buffer segnala inviato (conferma del provider, NON verifica su TikTok)
+REMOTE_BUFFER_ERROR = "BUFFER_REPORTS_ERROR"    # Buffer segnala errore
+REMOTE_VERIFIED = "EXTERNALLY_VERIFIED"         # l'utente ha verificato il post visibile su TikTok
+REMOTE_UNCERTAIN = "UNCERTAIN"                  # stato esterno non determinabile
+
+VERIFY_NONE = "NONE"
+VERIFY_EXTERNAL = "EXTERNALLY_VERIFIED"
+
+
+# ---- Transizioni legali (documentazione eseguibile + controllo a runtime: una violazione NON blocca ma genera l'evento `illegal_transition`)
+_C = {
+    DISCOVERED: {WAITING_FOR_MEDIA, DOWNLOADED, FAILED},
+    WAITING_FOR_MEDIA: {WAITING_FOR_MEDIA, DOWNLOADED, FAILED},
+    DOWNLOADED: {ANALYZING, DOWNLOADED, WAITING_FOR_MEDIA, FAILED},
+    ANALYZING: {ANALYZED, DOWNLOADED, FAILED},
+    ANALYZED: {RENDERING, ANALYZED, FAILED},
+    RENDERING: {READY, ANALYZED, FAILED},
+    READY: {AUTO_READY, NEEDS_REVIEW, APPROVED},
+    AUTO_READY: {APPROVED, NEEDS_REVIEW, REJECTED, SKIPPED, ANALYZED},
+    NEEDS_REVIEW: {APPROVED, REJECTED, SKIPPED, ANALYZED},
+    APPROVED: {ANALYZED, REJECTED, SKIPPED, NEEDS_REVIEW},
+    REJECTED: {NEEDS_REVIEW, ANALYZED, APPROVED},
+    SKIPPED: {NEEDS_REVIEW, ANALYZED, AUTO_READY},
+    FAILED: {DISCOVERED, DOWNLOADED, ANALYZED},
+}
+_P = {
+    QUEUED_LOCAL: {QUEUED_LOCAL, UPLOADING_ASSET, SCHEDULING, DRY_RUN_OK, CANCELLED, RETRY_PENDING, PUB_FAILED, PUB_NEEDS_REVIEW},
+    UPLOADING_ASSET: {SCHEDULING, QUEUED_LOCAL, RETRY_PENDING, PUB_FAILED, PUB_NEEDS_REVIEW},
+    SCHEDULING: {SCHEDULED_REMOTE, QUEUED_LOCAL, RETRY_PENDING, PUB_NEEDS_REVIEW, PUB_FAILED},
+    SCHEDULED_REMOTE: {PUBLISHED, PUB_FAILED, PUB_NEEDS_REVIEW},
+    RETRY_PENDING: {RETRY_PENDING, QUEUED_LOCAL, UPLOADING_ASSET, SCHEDULING, DRY_RUN_OK, CANCELLED, PUB_FAILED, PUB_NEEDS_REVIEW},
+    PUB_NEEDS_REVIEW: {QUEUED_LOCAL, SCHEDULED_REMOTE, PUBLISHED, PUB_FAILED, CANCELLED},
+    PUB_FAILED: {QUEUED_LOCAL, PUBLISHED, SCHEDULED_REMOTE},
+    DRY_RUN_OK: {QUEUED_LOCAL, CANCELLED},
+    CANCELLED: {QUEUED_LOCAL},
+    PUBLISHED: set(),  # terminale: «Buffer segnala inviato» non si ritratta
+}
+LEGAL = {"clip": _C, "publication": _P}
+
+
+def is_legal(entity: str, old: str | None, new: str) -> bool:
+    if old is None or old == new:
+        return True
+    table = LEGAL.get(entity)
+    return table is None or new in table.get(old, set())

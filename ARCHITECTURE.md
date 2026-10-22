@@ -33,15 +33,25 @@ data/ originals/ rendered/ previews/ temp/ public/ fixtures/ clipy.db
 Ogni transizione è registrata in `state_transitions`; ogni evento in `events` (messaggi sanificati).
 
 ## Review gate (`domain/review_gate.py`)
-Funzione pura e deterministica, versione `gate-1.0`. Segnali: ffprobe/safe-area del render, audio, evidenze (trascrizione/frame/metadata), confidenza (solo uno dei segnali), flag di analisi,
+Funzione pura e deterministica, versione `gate-1.0`. Segnali (ognuno con motivazione esplicita in `reasons[]`): analisi AI fallita (`analysis_failed`), trascrizione assente/inutilizzabile (`asr_unavailable`, `transcript_unusable`), termini sensibili, caption malformata/URL, ffprobe/safe-area/sincronia A-V del render, audio, evidenze (trascrizione/frame/metadata), confidenza (solo uno dei segnali), flag di analisi,
 PII (email/telefono/IBAN), parole vietate, numeri non supportati dalle evidenze, grounding del titolo, titoli duplicati, crop landscape, analisi simulata su clip reale. Output: `AUTO_READY` o
 `NEEDS_REVIEW` con `reasons[]` leggibili. Le clip in review non consumano slot.
 
 ## Coda e pubblicazione
-`queue.rebuild` (idempotente) crea al massimo un job per `(clip, canale, versione contenuto)` e assegna gli slot FIFO con `calculate_next_slots` (pura, DST-safe, tetto giornaliero).
-`publishing.tick`: rebuild → dispatch entro `lookahead_hours` → riconciliazione. Stati: `QUEUED_LOCAL → UPLOADING_ASSET → SCHEDULING → SCHEDULED_REMOTE → PUBLISHED`
-(`PUBLISHED` solo se lo stato remoto lo conferma). `DRY_RUN_OK` = simulato, nessuna richiesta esterna. L'intenzione di `createPost` è persistita *prima* della chiamata; dopo timeout/crash si
-cerca il post remoto (adozione se 1, `NEEDS_REVIEW` se ambiguo, retry sicuro se 0).
+`queue.rebuild` (idempotente) crea al massimo un job per `(clip, canale, versione contenuto)` e assegna gli slot FIFO con `calculate_next_slots` (pura, DST-safe, tetto giornaliero; numero e orari configurabili, default 4 post/giorno 10:00·13:30·17:30·21:00 `Europe/Rome`).
+`publishing.tick`: recupero upload interrotti → rebuild → dispatch entro `lookahead_hours` → riconciliazione. Stati locali: `QUEUED_LOCAL → UPLOADING_ASSET → SCHEDULING → SCHEDULED_REMOTE → PUBLISHED` (+ `RETRY_PENDING`, `NEEDS_REVIEW`, `FAILED`, `CANCELLED`, `DRY_RUN_OK` = simulato).
+
+**Stato remoto granulare** (`remote_state` + `verification`, indipendenti dallo stato locale):
+`LOCAL` · `SENDING` (richiesta in corso o esito da riconciliare, oppure Buffer "sending") · `SCHEDULED_ON_BUFFER` · `BUFFER_REPORTS_SENT` (conferma generica del provider) · `BUFFER_REPORTS_ERROR` · `EXTERNALLY_VERIFIED` (solo con conferma manuale dell'utente) · `UNCERTAIN`.
+`PUBLISHED` significa **"Buffer segnala inviato"**; la visibilità su TikTok non è mai dichiarata verificata senza conferma esplicita.
+
+**Idempotenza e concorrenza**
+- `process_job` acquisisce un lock di riga e **rilegge lo stato sotto lock**: una lista di job obsoleta (altra istanza, tick sovrapposti) non può rifare `createPost`.
+- L'intenzione di invio (`SCHEDULING`, `send_started_at`) è persistita **prima** di `createPost`.
+- Esito incerto (timeout, 5xx, risposta illeggibile, successo senza ID, crash): **nessuna seconda create automatica**. Si cerca il post su Buffer (paginazione completa): 1 riscontro con testo identico → adottato; più riscontri, o post allo stesso orario con testo diverso, o ricerca incompleta → `NEEDS_REVIEW`; nessun riscontro → serve un periodo di grazia (5 min) e ≥ 2 ricerche complete e vuote prima del retry sicuro.
+- Rifiuti certi prima dell'esecuzione (429, DNS/connessione, 4xx, `MutationError`) non sono ambigui: backoff (`Retry-After` rispettato) o revisione.
+- Slot scaduto prima dell'invio → il job torna in coda locale e prende il prossimo slot (mai `dueAt` nel passato).
+- Lease: leader unico del worker (lease nel DB, TTL 60 s). I lock orfani si liberano solo da chi è l'unico leader (all'acquisizione della leadership e all'avvio se nessun altro leader è vivo): una seconda istanza non azzera i lock di quella attiva.
 
 ## Sicurezza
 Bind `127.0.0.1`, CORS limitato, segreti solo nel DB locale (mai restituiti dalle API né loggati), `live_enabled`/`is_connected` modificabili solo da endpoint dedicati con frase di conferma,

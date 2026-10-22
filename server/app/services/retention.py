@@ -38,6 +38,9 @@ def cleanup(db: Session) -> dict:
         for f in env.dir(sub).glob("*"):
             if f.is_file() and time.time() - f.stat().st_mtime > 2 * 86400:
                 f.unlink(missing_ok=True)
+    from app.services import housekeeping
+
+    housekeeping.cleanup_stale_files()  # parziali orfani (.part) di download/render interrotti
     if removed:
         events.emit(db, "retention", "cleanup", f"Retention: {removed} file rimossi ({freed // 1024 // 1024} MB)")
     return {"removed": removed, "freed_bytes": freed}
